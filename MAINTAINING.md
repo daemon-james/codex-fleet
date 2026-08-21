@@ -154,6 +154,15 @@ Until the right key is found, tell a resumed agent to put findings in its final
 message and checkpoint on its behalf. The turn still works, it just cannot
 remember anything itself.
 
+**A worktree is branched at spawn and never moves on its own.** Resume a
+reviewer three commits later and it reads the files it was born with while being
+asked about a commit that is not in them. It then reports what it sees, which
+looks like a confused review and is actually correct reporting of a tree nobody
+advanced. `say` now merges the repo's current branch into the worktree first,
+and prints what it did. It refuses to touch a worktree holding uncommitted work
+or one that cannot merge cleanly, because discarding an agent's work to tidy a
+branch is worse than a stale read.
+
 **A run's env var is set at spawn and cannot be retrofitted.** `CODEX_FLEET_RUN`
 is the only thing that tells the inbox hook which mailbox to read. An agent
 started before that wiring existed can never receive a `tell`. If you add

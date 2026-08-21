@@ -664,6 +664,63 @@ def cmd_result(args):
     print(text)
 
 
+def refresh_worktree(meta):
+    """Bring a run's worktree up to the repo's current branch before a resume.
+
+    A worktree is branched at spawn and then never moves. Resume a reviewer
+    three commits later and it reads the files it was born with while being
+    asked about a commit that is not in them. It reports what it sees, which
+    looks like a stale or confused review and is actually correct reporting of
+    a tree nobody advanced.
+
+    Hand-merging it works and was done twice on 2026-08-21 before this existed.
+    Doing it here means it cannot be forgotten on the third round, which is the
+    round where it matters most.
+
+    Merges only. A worktree holding uncommitted work, or one that cannot
+    fast-forward cleanly, is left exactly as it is and reported, because
+    silently discarding an agent's work to tidy a branch is worse than a stale
+    read.
+    """
+    wt = meta.get("worktree")
+    root = meta.get("worktree_root")
+    if not wt or not root or not Path(wt).exists():
+        return None
+
+    dirty = subprocess.run(
+        ["git", "-C", wt, "status", "--porcelain"], capture_output=True, text=True
+    )
+    if dirty.returncode != 0:
+        return None
+    if dirty.stdout.strip():
+        return "holds uncommitted work, left alone"
+
+    head = subprocess.run(
+        ["git", "-C", root, "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True,
+    )
+    branch = head.stdout.strip()
+    if head.returncode != 0 or not branch or branch == "HEAD":
+        return None
+
+    before = subprocess.run(
+        ["git", "-C", wt, "rev-parse", "--short", "HEAD"], capture_output=True, text=True
+    ).stdout.strip()
+    merged = subprocess.run(
+        ["git", "-C", wt, "-c", "user.name=codex-fleet",
+         "-c", "user.email=codex-fleet@localhost",
+         "merge", "--no-edit", branch],
+        capture_output=True, text=True,
+    )
+    if merged.returncode != 0:
+        subprocess.run(["git", "-C", wt, "merge", "--abort"], capture_output=True)
+        return f"could not merge {branch}, left at {before}"
+    after = subprocess.run(
+        ["git", "-C", wt, "rev-parse", "--short", "HEAD"], capture_output=True, text=True
+    ).stdout.strip()
+    return None if before == after else f"advanced {before} to {after}"
+
+
 def cmd_say(args):
     meta = load_meta(args.name)
     if alive(meta.get("pid")):
@@ -672,6 +729,9 @@ def cmd_say(args):
         die(f"{args.name} has no thread id; cannot resume")
     if args.effort:
         meta["effort"] = args.effort
+    note = refresh_worktree(meta)
+    if note:
+        print(f"  worktree {note}")
     _, events_path = launch(args.name, meta, args.prompt, resume_id=meta["thread_id"])
     print(f"{args.name}: turn {meta['turns']} started (pid {meta['pid']})")
     if args.follow:

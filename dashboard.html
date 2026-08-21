@@ -109,27 +109,26 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:poin
 /* Filtering is class-driven so it is instant on a log of any length. */
 body.h-think .ev.think{display:none}
 body.h-cmd .ev.cmd{display:none}
-body.h-flight .ev.cmd-start{display:none}
+.ev.cmd-start{display:none}
 body.h-file .ev.file{display:none}
 body.h-tool .ev.tool{display:none}
 body.h-meta .ev.meta,body.h-meta .ev.todo{display:none}
 
 /* ---- stream ---- */
 #wrap{flex:1;position:relative;min-height:0}
-#log{height:100%;overflow:auto;padding:2rem 2.5rem 4rem;scrollbar-width:thin;scrollbar-color:var(--line2) transparent}
+#log{height:100%;overflow:auto;padding:2rem 2.5rem 4rem 4.7rem;scrollbar-width:thin;scrollbar-color:var(--line2) transparent}
 #log::-webkit-scrollbar{width:12px}
 #log::-webkit-scrollbar-thumb{background:var(--line2);border-radius:99px;border:4px solid var(--bg)}
 #stream{max-width:96ch}
-.ev{display:grid;grid-template-columns:1.6rem minmax(0,1fr);column-gap:.6rem;margin:0;padding:.12rem 0}
+.ev{display:grid;grid-template-columns:1.6rem minmax(0,1fr);column-gap:.6rem;margin:0 0 0 -2.2rem;padding:.12rem 0}
 .ev .g{font-family:var(--mono);font-size:.8rem;text-align:center;color:var(--faint);line-height:1.75;user-select:none}
 .ev .t{min-width:0;white-space:pre-wrap;word-break:break-word;font-size:.88rem;color:var(--ink2);line-height:1.6}
 .ev.think .g{color:var(--think)}
 .ev.think .t{color:var(--think);font-size:.88rem}
 .ev.think .t.md{white-space:normal}
-.ev.cmd .t,.ev.cmd-start .t,.ev.file .t,.ev.tool .t{font-family:var(--mono);font-size:.82rem;line-height:1.65}
+.ev.cmd .t,.ev.file .t,.ev.tool .t{font-family:var(--mono);font-size:.82rem;line-height:1.65}
 .ev.cmd .g,.ev.cmd .t{color:var(--cmd)}
 .ev.cmd .t .out{display:block;color:var(--dim);margin-top:.15rem}
-.ev.cmd-start .g,.ev.cmd-start .t{color:var(--cmd);opacity:.55}
 .ev.file .g,.ev.file .t{color:var(--file)}
 .ev.tool .g,.ev.tool .t{color:var(--tool)}
 .ev.meta .t,.ev.todo .t{color:var(--dim);font-size:.82rem}
@@ -174,14 +173,15 @@ body.h-meta .ev.meta,body.h-meta .ev.todo{display:none}
   border-radius:99px;background:var(--panel);color:var(--ink);font-size:.86rem;
   font-weight:500;box-shadow:var(--shadow);transition:all .12s}
 #jump:hover{border-color:var(--accent);color:var(--accent-ink);transform:translateY(-1px)}
-#empty{color:var(--dim);padding:6rem 2rem;font-size:1rem;text-align:center;max-width:36rem;margin:0 auto;line-height:1.6}
+#empty{color:var(--dim);padding:6rem 0;font-size:1rem;max-width:36rem;line-height:1.6}
 #empty b{color:var(--ink2);font-weight:600}
 
 @media(prefers-reduced-motion:reduce){.pill.running::before{animation:none}#jump{transition:none}}
 @media(max-width:860px){
   body{grid-template-columns:1fr;grid-template-rows:40vh 1fr}
   #side{border-right:0;border-bottom:1px solid var(--line)}
-  #bar,#log{padding-left:1.2rem;padding-right:1.2rem}
+  #bar{padding-left:1.2rem;padding-right:1.2rem}
+  #log{padding-left:3.4rem;padding-right:1.2rem}
   #jump{right:1.2rem}
 }
 </style></head><body>
@@ -200,7 +200,6 @@ body.h-meta .ev.meta,body.h-meta .ev.todo{display:none}
       <span class="lbl">Show</span>
       <button class="tg" data-f="think" aria-pressed="true"><span class="g">~</span>reasoning</button>
       <button class="tg" data-f="cmd" aria-pressed="true"><span class="g">$</span>commands</button>
-      <button class="tg" data-f="flight" aria-pressed="false"><span class="g">&rarr;</span>in flight</button>
       <button class="tg" data-f="file" aria-pressed="true"><span class="g">&plusmn;</span>file edits</button>
       <button class="tg" data-f="tool" aria-pressed="true"><span class="g">&#9881;</span>tool calls</button>
       <button class="tg" data-f="meta" aria-pressed="false"><span class="g">&middot;</span>turn markers</button>
@@ -366,7 +365,8 @@ function atBottom(){return log.scrollHeight-log.scrollTop-log.clientHeight<80}
 log.addEventListener("scroll",()=>{if(atBottom())$("jump").hidden=true});
 $("jump").onclick=()=>{log.scrollTop=log.scrollHeight;$("jump").hidden=true};
 // Each toggle maps to one body class. Pressed means show, so the class it
-// toggles is the hide-class; in-flight and turn markers start hidden.
+// toggles is the hide-class; turn markers start hidden. In-flight command
+// notices are never shown in the browser; the CLI tail still prints them.
 document.querySelectorAll(".tg[data-f]").forEach(function(el){
   const f=el.dataset.f;
   document.body.classList.toggle("h-"+f,el.getAttribute("aria-pressed")!=="true");

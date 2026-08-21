@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>codex-fleet</title>
+<style>
+:root{
+  --bg:#f7f7f8; --panel:#fff; --raise:#fbfbfc;
+  --ink:#17171a; --ink2:#4a4a52; --dim:#8a8a94; --line:#e6e6ea;
+  --accent:#5b5bd6; --accent-soft:#eeeefb;
+  --run:#0f9960; --run-soft:#e6f5ee;
+  --fail:#d1383a; --fail-soft:#fbeaea;
+  --idle:#8a8a94; --idle-soft:#efeff2;
+  --msg:#0b6b45; --msg-bg:#f0f8f4; --msg-line:#8fd3b4;
+  --cmd:#2b5f8f; --think:#7d7d88; --file:#8a6212; --tool:#6d4aa8;
+  --shadow:0 1px 2px rgba(20,20,30,.05),0 4px 14px rgba(20,20,30,.05);
+}
+@media(prefers-color-scheme:dark){:root{
+  --bg:#0f0f12; --panel:#17171b; --raise:#1c1c21;
+  --ink:#eeeef2; --ink2:#b9b9c4; --dim:#7e7e8c; --line:#28282f;
+  --accent:#8b8bf0; --accent-soft:#22223a;
+  --run:#3ddc9a; --run-soft:#123027;
+  --fail:#ff7b7d; --fail-soft:#341a1c;
+  --idle:#7e7e8c; --idle-soft:#232329;
+  --msg:#6fdcaa; --msg-bg:#132720; --msg-line:#2f7a5c;
+  --cmd:#7fb6ea; --think:#82828f; --file:#e2b264; --tool:#b79cf0;
+  --shadow:0 1px 2px rgba(0,0,0,.3),0 4px 14px rgba(0,0,0,.25);
+}}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;
+  font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,"Helvetica Neue",Arial,sans-serif;
+  background:var(--bg);color:var(--ink);
+  display:grid;grid-template-columns:min(340px,32vw) 1fr;height:100vh;overflow:hidden;
+  -webkit-font-smoothing:antialiased;
+}
+#side{border-right:1px solid var(--line);overflow:auto;background:var(--panel);
+  scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+#side::-webkit-scrollbar{width:10px}
+#side::-webkit-scrollbar-thumb{background:var(--line);border-radius:99px;border:3px solid var(--panel)}
+#head{position:sticky;top:0;z-index:5;background:var(--panel);
+  padding:18px 18px 12px;border-bottom:1px solid var(--line)}
+#head h1{margin:0;font-size:15px;font-weight:650;letter-spacing:-.01em;display:flex;align-items:center;gap:9px}
+#head .count{margin-top:3px;font-size:12px;color:var(--dim)}
+.spark{width:8px;height:8px;border-radius:99px;background:var(--run);flex:0 0 auto}
+.spark.off{background:var(--dim);opacity:.45}
+#runs{padding:8px}
+.run{padding:11px 12px;border-radius:10px;cursor:pointer;margin-bottom:2px;
+  border:1px solid transparent;transition:background .12s,border-color .12s}
+.run:hover{background:var(--raise)}
+.run.sel{background:var(--accent-soft);border-color:var(--accent)}
+.run .top{display:flex;align-items:center;gap:8px;min-width:0}
+.run .nm{font-weight:600;font-size:14px;letter-spacing:-.01em;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.pill{font-size:10.5px;font-weight:650;letter-spacing:.04em;text-transform:uppercase;
+  padding:2.5px 7px;border-radius:99px;flex:0 0 auto;line-height:1.3;margin-left:auto}
+.pill.running{background:var(--run-soft);color:var(--run)}
+.pill.idle,.pill.stopped{background:var(--idle-soft);color:var(--idle)}
+.pill.failed{background:var(--fail-soft);color:var(--fail)}
+.pill.running::before{content:"";display:inline-block;width:5px;height:5px;border-radius:99px;
+  background:currentColor;margin-right:5px;vertical-align:1px;animation:pulse 1.5s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.run .meta{margin-top:5px;font-size:12px;color:var(--dim);display:flex;gap:5px;flex-wrap:wrap;align-items:center}
+.run .meta .sep{opacity:.4}
+.run .last{margin-top:6px;font-size:12.5px;color:var(--ink2);line-height:1.45;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+#main{display:flex;flex-direction:column;min-width:0;overflow:hidden;background:var(--bg)}
+#bar{padding:14px 22px;border-bottom:1px solid var(--line);background:var(--panel);
+  display:flex;gap:14px;align-items:center;flex-wrap:wrap;flex:0 0 auto}
+#title{font-size:17px;font-weight:650;letter-spacing:-.015em}
+#chips{display:flex;gap:6px;flex-wrap:wrap}
+.chip{font-size:11.5px;color:var(--ink2);background:var(--raise);border:1px solid var(--line);
+  padding:3px 9px;border-radius:7px;white-space:nowrap}
+#toggles{margin-left:auto;display:flex;gap:5px;align-items:center;flex-wrap:wrap}
+.tg{font-size:11.5px;color:var(--dim);cursor:pointer;user-select:none;padding:4px 9px;
+  border:1px solid var(--line);border-radius:7px;background:var(--panel);transition:all .12s;
+  white-space:nowrap}
+.tg:hover{border-color:var(--accent);color:var(--ink2)}
+.tg.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent);font-weight:600}
+.tg input{display:none}
+.tg .g{opacity:.65;margin-right:4px;font-family:ui-monospace,Menlo,monospace}
+#find{font:inherit;font-size:12px;padding:5px 10px;border:1px solid var(--line);border-radius:7px;
+  background:var(--panel);color:var(--ink);width:150px;transition:all .12s}
+#find:focus{outline:none;border-color:var(--accent);width:220px}
+#find::placeholder{color:var(--dim)}
+#hits{font-size:11.5px;color:var(--dim);min-width:52px}
+
+/* Filtering is class-driven so it is instant on a log of any length. */
+body.h-think .ev.think{display:none}
+body.h-cmd .ev.cmd{display:none}
+body.h-flight .ev.cmd-start{display:none}
+body.h-file .ev.file{display:none}
+body.h-tool .ev.tool{display:none}
+body.h-meta .ev.meta,body.h-meta .ev.todo{display:none}
+.ev.nomatch{display:none}
+#wrap{flex:1;position:relative;min-height:0}
+#log{height:100%;overflow:auto;padding:18px 22px 32px;
+  scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+#log::-webkit-scrollbar{width:12px}
+#log::-webkit-scrollbar-thumb{background:var(--line);border-radius:99px;border:4px solid var(--bg)}
+.ev{white-space:pre-wrap;word-break:break-word;margin:0 0 2px;padding:2px 0 2px 12px;
+  border-left:2px solid transparent;font-size:13px}
+.ev.think{color:var(--think);font-style:italic;font-size:12.5px}
+.ev.cmd,.ev.cmd-start{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  font-size:12.5px;color:var(--cmd)}
+.ev.cmd-start{opacity:.6}
+.ev.file{color:var(--file);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
+.ev.tool{color:var(--tool);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
+.ev.meta,.ev.todo{color:var(--dim);font-size:12.5px}
+.ev.msg{color:var(--msg);background:var(--msg-bg);border-left:3px solid var(--msg-line);
+  margin:12px 0;padding:11px 14px;border-radius:0 9px 9px 0;font-size:13.5px;line-height:1.6;
+  box-shadow:var(--shadow)}
+.ev.fail{color:var(--fail);background:var(--fail-soft);border-left:3px solid var(--fail);
+  margin:10px 0;padding:10px 14px;border-radius:0 9px 9px 0}
+#jump{position:absolute;right:26px;bottom:22px;padding:9px 16px;border:1px solid var(--line);
+  border-radius:99px;background:var(--panel);color:var(--ink);font:inherit;font-size:12.5px;
+  font-weight:600;cursor:pointer;box-shadow:var(--shadow);transition:all .12s}
+#jump:hover{border-color:var(--accent);color:var(--accent);transform:translateY(-1px)}
+#empty{color:var(--dim);padding:56px 22px;font-size:14px;text-align:center}
+</style></head><body>
+<div id="side">
+  <div id="head">
+    <h1><span class="spark off" id="spark"></span>codex-fleet</h1>
+    <div class="count" id="count">loading</div>
+  </div>
+  <div id="runs"></div>
+</div>
+<div id="main">
+  <div id="bar">
+    <span id="title">no run selected</span>
+    <span id="chips"></span>
+    <span id="toggles">
+      <input id="find" type="search" placeholder="filter text" autocomplete="off">
+      <span id="hits"></span>
+      <label class="tg on" data-f="think"><span class="g">~</span>reasoning</label>
+      <label class="tg on" data-f="cmd"><span class="g">$</span>commands</label>
+      <label class="tg" data-f="flight"><span class="g">&rarr;</span>in-flight</label>
+      <label class="tg on" data-f="file"><span class="g">&plusmn;</span>files</label>
+      <label class="tg on" data-f="tool"><span class="g">&#9881;</span>tools</label>
+      <label class="tg" data-f="meta"><span class="g">&middot;</span>meta</label>
+      <label class="tg" id="tg-verb"><input type="checkbox" id="verbose">output</label>
+    </span>
+  </div>
+  <div id="wrap">
+    <div id="log"><div id="empty">Pick a run on the left.</div></div>
+    <button id="jump" hidden>New events &darr;</button>
+  </div>
+</div>
+<script>
+let sel=null,next=0,verbose=false;
+const $=id=>document.getElementById(id);
+const log=$("log");
+const esc=t=>(t||"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+async function j(u){const r=await fetch(u);return r.json()}
+function pick(name){if(sel===name)return;sel=name;next=0;log.innerHTML="";log.scrollTop=0;
+$("jump").hidden=true;$("title").textContent=name;draw();poll()}
+async function draw(){
+  const runs=await j("/api/runs");
+  const live=runs.filter(r=>r.status==="running").length;
+  $("spark").className="spark"+(live?"":" off");
+  $("count").textContent=live?(live+" running of "+runs.length):(runs.length+" runs, none active");
+  $("runs").innerHTML=runs.map(function(r){
+    return '<div class="run '+(r.name===sel?"sel":"")+'" data-n="'+esc(r.name)+'">'
+      +'<div class="top"><span class="nm">'+esc(r.name)+'</span>'
+      +'<span class="pill '+r.status+'">'+r.status+'</span></div>'
+      +'<div class="meta"><span>'+esc(r.role)+'</span><span class="sep">&middot;</span>'
+      +'<span>'+esc(r.effort)+'</span><span class="sep">&middot;</span>'
+      +'<span>'+r.out.toLocaleString()+' tok</span><span class="sep">&middot;</span>'
+      +'<span>'+esc(r.age)+'</span></div>'
+      +'<div class="last">'+esc(r.last)+'</div></div>';
+  }).join("");
+  document.querySelectorAll(".run").forEach(e=>e.onclick=()=>pick(e.dataset.n));
+  const cur=runs.find(r=>r.name===sel);
+  $("chips").innerHTML=cur?[cur.model,cur.sandbox,cur.cwd].map(v=>'<span class="chip">'+esc(v)+'</span>').join(""):"";
+}
+async function poll(){
+  if(!sel)return;
+  const d=await j("/api/events?name="+encodeURIComponent(sel)+"&from="+next+"&verbose="+(verbose?1:0));
+  if(d.events&&d.events.length){
+    const e0=$("empty");if(e0)e0.remove();
+    // Measure BEFORE appending: was the reader at the bottom a moment ago?
+    const stick=atBottom();
+    for(const e of d.events){
+      const p=document.createElement("div");p.className="ev "+e.kind;p.textContent=e.text;log.appendChild(p);
+    }
+    if(needle)countHits();
+    if(stick)log.scrollTop=log.scrollHeight;else $("jump").hidden=false;
+  }
+  next=d.total;
+}
+function atBottom(){return log.scrollHeight-log.scrollTop-log.clientHeight<80}
+log.addEventListener("scroll",()=>{if(atBottom())$("jump").hidden=true});
+$("jump").onclick=()=>{log.scrollTop=log.scrollHeight;$("jump").hidden=true};
+// Each chip maps to one body class. "on" means show, so the class it toggles is
+// the hide-class, and the two defaults that start off are in-flight and meta.
+document.querySelectorAll(".tg[data-f]").forEach(function(el){
+  const f=el.dataset.f;
+  document.body.classList.toggle("h-"+f, !el.classList.contains("on"));
+  el.onclick=function(){
+    const on=el.classList.toggle("on");
+    document.body.classList.toggle("h-"+f, !on);
+    countHits();
+  };
+});
+
+const find=$("find");
+let needle="";
+function countHits(){
+  const rows=log.querySelectorAll(".ev");
+  let shown=0;
+  rows.forEach(function(r){
+    const hit=!needle||r.textContent.toLowerCase().includes(needle);
+    r.classList.toggle("nomatch",!hit);
+    if(hit&&r.offsetParent!==null)shown++;
+  });
+  $("hits").textContent=needle?(shown+" of "+rows.length):"";
+}
+find.oninput=function(){needle=find.value.trim().toLowerCase();countHits()};
+$("verbose").onchange=e=>{verbose=e.target.checked;$("tg-verb").classList.toggle("on",verbose);
+next=0;log.innerHTML="";$("jump").hidden=true;
+poll().then(()=>{log.scrollTop=log.scrollHeight})};
+draw();setInterval(draw,2000);setInterval(poll,1200);
+</script></body></html>

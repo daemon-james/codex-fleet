@@ -1,0 +1,168 @@
+# Maintaining codex-fleet
+
+Read this before changing anything here. It is short, and the traps section
+below is the part that will save you: each item is something that shipped
+broken, or nearly did, in a single afternoon of building this.
+
+## What this is, and is not
+
+A development tool for running Codex agents in the background. **It is not part
+of Mnemonik.** Do not commit any of it into the Mnemonik repository, do not put
+its docs in Mnemonik's `docs/`, and do not add Mnemonik as a dependency. The
+only connection is that agent briefs written for Mnemonik work include a
+paragraph authorizing Mnemonik's MCP tools, and that paragraph is a template in
+the skill, not code here.
+
+## Where the pieces live
+
+Three files, three destinations, all symlinked by `install.sh`:
+
+| Repo file | Symlinked to | Read by |
+| --- | --- | --- |
+| `codex-fleet` | `~/.local/bin/codex-fleet` | you, and agents calling `codex-fleet ask` |
+| `hooks/codex-fleet-inbox.py` | `~/.codex/hooks/codex-fleet-inbox.py` | Codex, on `PostToolUse` |
+| `hooks/codex-fleet-status.py` | `~/.claude/hooks/codex-fleet-status.py` | Claude Code, on `PostToolUse` and `UserPromptSubmit` |
+
+Symlinks, not copies, so an edit here is live immediately and there is no deploy
+step to forget.
+
+Registration is separate from installation and `install.sh` deliberately does
+not do it, because both hosts gate it:
+
+- **Codex** reads `~/.codex/hooks.json`. The inbox hook is a second group under
+  `PostToolUse`, appended beside the Mnemonik hook rather than replacing it.
+  Codex asks the owner to trust a new hook once, recording a `trusted_hash` in
+  `~/.codex/config.toml` under a key like
+  `hooks.state."~/.codex/hooks.json:post_tool_use:1:0"`. **Until they approve
+  it, `codex-fleet tell` queues messages that are never delivered, silently.**
+- **Claude Code** reads `~/.claude/settings.json`.
+
+Runtime state lives in `~/.codex-fleet/`: `runs/<name>/` per run, and
+`worktrees/<name>/` for `spawn -w`. Nothing there is precious except
+`meta.json`, which holds the `thread_id` that keeps a run resumable.
+
+## Changing it
+
+```bash
+# edit codex-fleet, then:
+python3 -m unittest discover -s tests        # the suite
+./install.sh --check                         # symlinks still right
+codex-fleet list                             # smoke test
+
+# edit dashboard.html, then ALWAYS:
+tools/embed-page.py                          # never hand-edit the embedded copy
+```
+
+A running `codex-fleet serve` holds its code in memory. **Restart it after any
+change** or you will test the old version and conclude your fix did not work:
+
+```bash
+kill $(pgrep -f "^python3 .*codex-fleet serve")
+codex-fleet serve --port 8787 --host 0.0.0.0 &
+```
+
+Use `pgrep -f "^python3 .*codex-fleet serve"`, not `pkill -f "codex-fleet
+serve"`. The loose pattern matches the shell running the command and kills your
+own session. That happened twice.
+
+## Traps
+
+**The dashboard HTML cannot be edited through a Python string.** It is one
+triple-quoted string inside a single-file CLI. Editing it through a nested
+heredoc mangled every quote in the JavaScript: 86 occurrences of
+backslash-quote, invalid JS, in a file that still imported and passed
+`ast.parse` cleanly. Python cannot catch it. That is why `dashboard.html` is the
+source of truth and `tools/embed-page.py` is the only thing that writes the
+string. It refuses a page containing a backslash or a triple quote, and reads
+its own output back to confirm it survived.
+
+**Sort keys must stop moving.** Sorting runs by last-event time reads correctly
+and behaves terribly: a live agent rewrites its log every second, so two running
+agents swap places continuously and the list jumps under the reader. Running
+runs sort by START time, fixed for the life of the run. Everything else sorts by
+last activity, fixed once the process exits. If you change ordering, sample it
+repeatedly with agents live and prove it does not move.
+
+**`read-only` costs an agent its memory and its voice.** Under `-s read-only`
+Codex disables MCP approval, so `session_bootstrap` and `checkpoint` both fail,
+and the agent cannot write anywhere, so `codex-fleet ask` fails too. A reviewer
+once produced two criticals and could record neither. For review work use
+`-s workspace-write --worktree`: the throwaway worktree is the isolation and
+`-C` confines writes to it. Probed and confirmed: writes to the real repo and to
+`$HOME` both return `Read-only file system`, while MCP and `ask` work.
+
+**`workspace-write` needs `--approve-for-me`, not `-s`.** Under a plain `-s
+workspace-write` every MCP tool call dies with "MCP tool call requires approval,
+but approval policy is never". The tools are listed, the network is fine, and
+nothing can approve the call in a non-interactive run. `--approve-for-me`
+routes approvals through automatic review and refuses to combine with `-s`,
+which is why `build_cmd` branches.
+
+**Codex's own risk layer blocks sending file contents to an MCP server.** It
+rejected `mnemonik.file_context({filePaths})` with "This action was rejected due
+to unacceptable risk... would transmit potentially sensitive internal
+source-file contents". The agent then worked blind for the rest of its turn and
+mentioned it once. `memory_search`, `session_bootstrap` and `checkpoint` pass;
+only file CONTENTS trigger it. The fix is an explicit authorization paragraph in
+the brief, bounded to the repo so it stays truthful. The template is in the
+skill.
+
+**`say` cannot reach a running agent, and never will.** `codex exec` reads stdin
+only for the initial prompt, runs the turn to completion, and exits. There is no
+channel into a turn in flight. `tell` goes around it by writing
+`runs/<name>/inbox.jsonl`, which the Codex `PostToolUse` hook delivers as
+`additionalContext` on the agent's next tool call. `ask` is the same trick in
+reverse, and works because `build_cmd` passes `--add-dir <run_dir>` so the
+sandbox lets the agent write there.
+
+**A run's env var is set at spawn and cannot be retrofitted.** `CODEX_FLEET_RUN`
+is the only thing that tells the inbox hook which mailbox to read. An agent
+started before that wiring existed can never receive a `tell`. If you add
+another per-run channel, set it in `launch()` at the same time.
+
+**Every reader must survive a pruned run.** Pruning deletes the event log and
+keeps `meta.json` plus `result.txt`. Four separate readers broke on that,
+one at a time, after it shipped: `status_of` returned "stopped", `last_message`
+returned empty, `usage_of` returned zero, and `age`/`mtime` returned nothing so
+the run sank to the bottom forever. Each now takes an optional `meta` and falls
+back to a recorded value. **If you add a reader that touches `turn-*.jsonl`,
+give it the same fallback and a test.**
+
+**Agents report sandbox failures as test failures.** `listen EPERM` on
+`127.0.0.1`, `spawnSync` on git or bash, abstract Unix sockets, and database
+permission errors are all sandbox artefacts, not broken code. Re-run those
+suites yourself outside the sandbox before believing a red report. Tell agents
+in the brief to name which failures they believe are artefacts rather than
+chasing them.
+
+**A green report is not a green tree.** An agent reported 73 passing tests
+truthfully, then reverted generated build output to tidy its diff, which broke
+the very tests it had watched pass. "I ran it and it passed" and "it passes now"
+are different claims. Re-run the suite yourself in the tree as the agent left
+it.
+
+## Design decisions worth not relitigating
+
+**One file for the CLI.** It lives on `PATH` and agents invoke it. A package
+with imports would need installing inside every sandbox. The dashboard is the
+only part big enough to hurt, and `embed-page.py` handles that.
+
+**Two roles, two efforts, no `--model` flag.** `engineer` is `gpt-5.6-sol`,
+`reviewer` is `gpt-5.6-terra`. Constraining it stops the orchestrator from
+fiddling with model choice per task and stops a reviewer being handed build
+work.
+
+**Prune collapses, it does not delete.** 99.4% of a run's disk is its event log.
+The `thread_id` is what makes a finished agent worth keeping, because `say`
+resumes a warm context for one turn instead of paying a fresh agent to re-read
+everything. So old runs lose their transcript and keep their conclusion. `rm` is
+the only irreversible operation here, and it exists for closed workstreams.
+
+**Auto-prune runs on `spawn`.** That is the moment new disk is allocated, and a
+workflow you have to remember is not a workflow. It is silent unless it frees
+something, skips running agents and live worktrees, and `CODEX_FLEET_PRUNE_DAYS=0`
+turns it off.
+
+**Hooks fail open, always.** Both exit 0 with no output on any error. An
+observability hook that can break a tool call is worse than no hook. Keep the
+bare `except` at the bottom of each one.

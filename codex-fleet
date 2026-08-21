@@ -9,6 +9,7 @@ State lives in ~/.codex-fleet/runs/<name>/
 
 import argparse
 import contextlib
+import errno
 import io
 import json
 import os
@@ -1429,7 +1430,23 @@ def cmd_serve(args):
             self.wfile.write(body)
 
     # Bind every interface: this box is worked on from other machines on the LAN.
-    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    try:
+        srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    except OSError as exc:
+        if exc.errno != errno.EADDRINUSE:
+            raise
+        # One dashboard serves every run, so a second one is almost always a
+        # forgotten restart rather than a real intent. Say so in one line
+        # instead of a stack trace, and say how to take the port back.
+        print(
+            f"a dashboard is already serving http://{lan_ip()}:{args.port}\n"
+            f"  it reads the same run files, so it is already showing everything\n"
+            f"  restart it (after a code change) with:\n"
+            f"    kill $(pgrep -f \"^python3 .*codex-fleet serve\") "
+            f"&& codex-fleet serve --port {args.port} --host {args.host}",
+            file=sys.stderr,
+        )
+        sys.exit(0)
     print(f"codex-fleet dashboard on http://{lan_ip()}:{args.port}  (ctrl-c to stop)")
     srv.serve_forever()
 

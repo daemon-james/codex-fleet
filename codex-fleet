@@ -1,0 +1,1377 @@
+#!/usr/bin/env python3
+"""codex-fleet — spawn, watch, and talk to Codex agents running in parallel.
+
+State lives in ~/.codex-fleet/runs/<name>/
+  meta.json      run metadata (model, effort, cwd, thread_id, pid, turns)
+  turn-N.jsonl   raw event stream for turn N
+  turn-N.err     stderr for turn N
+"""
+
+import argparse
+import contextlib
+import io
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(os.environ.get("CODEX_FLEET_HOME", Path.home() / ".codex-fleet"))
+RUNS = ROOT / "runs"
+
+# Deliberately narrow. Role picks the model; nothing else is orchestrated here.
+#   engineer -> gpt-5.6-sol    (writing, refactoring, debugging, investigation)
+#   reviewer -> gpt-5.6-terra  (code review, critique, verification)
+ROLES = {"engineer": "gpt-5.6-sol", "reviewer": "gpt-5.6-terra"}
+MODELS = list(ROLES.values())
+# high for ordinary work, xhigh for complex or high-risk work.
+EFFORTS = ["high", "xhigh"]
+SANDBOXES = ["read-only", "workspace-write", "danger-full-access"]
+
+C = {
+    "dim": "\033[2m",
+    "red": "\033[31m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "blue": "\033[34m",
+    "cyan": "\033[36m",
+    "bold": "\033[1m",
+    "off": "\033[0m",
+}
+
+
+def paint(text, *styles):
+    if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+        return text
+    return "".join(C[s] for s in styles) + text + C["off"]
+
+
+def die(msg, code=1):
+    print(f"codex-fleet: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def slug(text):
+    s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return s[:40] or "run"
+
+
+def run_dir(name):
+    return RUNS / name
+
+
+def load_meta(name):
+    path = run_dir(name) / "meta.json"
+    if not path.exists():
+        die(f"no run named {name!r} (try: codex-fleet list)")
+    return json.loads(path.read_text())
+
+
+def save_meta(name, meta):
+    (run_dir(name) / "meta.json").write_text(json.dumps(meta, indent=2))
+
+
+def all_runs():
+    """Recent first, and STABLE while agents work.
+
+    Sorting purely by last-event time looks right and reads terribly: a live
+    agent rewrites its log every second, so two running agents swap places
+    continuously and the list you are trying to read jumps under you.
+
+    So the key has to stop moving. Running agents sit at the top ordered by when
+    they STARTED, which never changes for the life of the run. Everything else
+    sorts by last activity, which is also fixed once the process has exited.
+    Recent work stays near the top and nothing moves unless a run actually
+    changes state.
+    """
+    if not RUNS.exists():
+        return []
+    out = []
+    for d in RUNS.iterdir():
+        meta_path = d / "meta.json"
+        if meta_path.exists():
+            try:
+                out.append((d.name, json.loads(meta_path.read_text())))
+            except json.JSONDecodeError:
+                continue
+
+    def key(pair):
+        name, meta = pair
+        running = alive(meta.get("pid"))
+        if running:
+            # Newest run first, by start time. Fixed for the whole run.
+            return (0, -started_at(meta))
+        # Fixed once the process exits.
+        return (1, -mtime(run_dir(name) / f"turn-{meta.get('turns', 1)}.jsonl", meta))
+
+    out.sort(key=key)
+    return out
+
+
+def started_at(meta):
+    """Run start as a sortable number. Unparsable timestamps sort last."""
+    raw = meta.get("created_at")
+    if not raw:
+        return 0.0
+    try:
+        return datetime.fromisoformat(raw).timestamp()
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+def turn_files(name, meta):
+    d = run_dir(name)
+    return [d / f"turn-{i}.jsonl" for i in range(1, meta.get("turns", 0) + 1)]
+
+
+def read_events(path):
+    if not path.exists():
+        return []
+    events = []
+    for line in path.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            events.append({"type": "_unparsed", "raw": line})
+    return events
+
+
+def all_events(name, meta):
+    events = []
+    for path in turn_files(name, meta):
+        events.extend(read_events(path))
+    return events
+
+
+def status_of(name, meta):
+    if alive(meta.get("pid")):
+        return "running"
+    # A pruned run has no event log left. Its outcome was recorded before the
+    # log went, so read that rather than guessing "stopped" from an empty file.
+    if meta.get("pruned_at"):
+        return meta.get("final_status", "idle")
+    events = read_events(run_dir(name) / f"turn-{meta.get('turns', 1)}.jsonl")
+    for ev in reversed(events):
+        t = ev.get("type")
+        if t == "turn.completed":
+            return "idle"
+        if t in ("turn.failed", "error"):
+            return "failed"
+    err = run_dir(name) / f"turn-{meta.get('turns', 1)}.err"
+    if err.exists() and err.stat().st_size > 0 and not events:
+        return "failed"
+    return "stopped"
+
+
+def last_message(events, name=None):
+    for ev in reversed(events):
+        item = ev.get("item") or {}
+        if item.get("type") == "agent_message":
+            return item.get("text", "")
+    if name:
+        # Pruned: the conclusion outlived the log that produced it.
+        try:
+            return (run_dir(name) / "result.txt").read_text(encoding="utf-8")
+        except OSError:
+            return ""
+    return ""
+
+
+def usage_of(events, meta=None):
+    total = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
+    for ev in events:
+        if ev.get("type") == "turn.completed":
+            u = ev.get("usage") or {}
+            for k in total:
+                total[k] += u.get(k, 0) or 0
+    if meta and meta.get("pruned_at") and not any(total.values()):
+        return dict(total, **(meta.get("final_usage") or {}))
+    return total
+
+
+
+def mtime(path, meta=None):
+    """Last activity as a sortable number. Missing files sort last, not first.
+
+    A pruned run has no file, so it falls back to the activity time recorded
+    when its log was collapsed. Without that it would sort to the bottom
+    forever, which is the opposite of what pruning is for.
+    """
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        if meta and meta.get("last_activity"):
+            return float(meta["last_activity"])
+        return 0.0
+
+
+def age(path, meta=None):
+    stamp = mtime(path, meta)
+    if not stamp:
+        return "-"
+    delta = time.time() - stamp
+    if delta < 60:
+        return f"{int(delta)}s"
+    if delta < 3600:
+        return f"{int(delta / 60)}m"
+    return f"{int(delta / 3600)}h"
+
+
+# ---------------------------------------------------------------- rendering
+
+
+def describe(ev, verbose=False):
+    """One line per event. Unknown item types degrade to their JSON."""
+    t = ev.get("type")
+    if t == "thread.started":
+        return paint(f"· thread {ev.get('thread_id')}", "dim")
+    if t == "turn.started":
+        return paint("· turn started", "dim")
+    if t == "turn.completed":
+        u = ev.get("usage") or {}
+        return paint(
+            f"· turn completed  in={u.get('input_tokens', 0)} "
+            f"cached={u.get('cached_input_tokens', 0)} out={u.get('output_tokens', 0)}",
+            "dim",
+        )
+    if t == "turn.failed":
+        return paint(f"✗ turn failed: {json.dumps(ev.get('error', ev))[:400]}", "red")
+    if t == "_unparsed":
+        return paint(ev["raw"][:400], "dim")
+    if t not in ("item.completed", "item.started", "item.updated"):
+        return paint(f"· {t} {json.dumps(ev)[:200]}", "dim")
+
+    item = ev.get("item") or {}
+    kind = item.get("type", "?")
+    if t != "item.completed":
+        # in-flight notice, so a live watcher sees work before it finishes
+        if kind == "command_execution":
+            cmd = item.get("command") or item.get("cmd") or ""
+            if isinstance(cmd, list):
+                cmd = " ".join(cmd)
+            return paint(f"→ {cmd.strip()[:200]}", "dim")
+        return None
+
+    if kind == "agent_message":
+        text = item.get("text", "").strip()
+        return paint("▸ ", "green") + text
+    if kind == "reasoning":
+        text = (item.get("text") or item.get("summary") or "").strip()
+        if not verbose:
+            text = text.split("\n")[0][:160]
+        return paint(f"~ {text}", "dim")
+    if kind == "command_execution":
+        cmd = item.get("command") or item.get("cmd") or ""
+        if isinstance(cmd, list):
+            cmd = " ".join(cmd)
+        exit_code = item.get("exit_code")
+        mark = "$" if exit_code in (0, None) else f"$[{exit_code}]"
+        line = paint(f"{mark} {cmd.strip()[:300]}", "cyan")
+        out = (item.get("aggregated_output") or "").strip()
+        if verbose and out:
+            body = "\n".join("    " + l for l in out.splitlines()[:40])
+            line += "\n" + paint(body, "dim")
+        return line
+    if kind == "file_change":
+        changes = item.get("changes") or []
+        parts = []
+        for ch in changes:
+            if isinstance(ch, dict):
+                parts.append(f"{ch.get('kind', 'edit')} {ch.get('path', '?')}")
+            else:
+                parts.append(str(ch))
+        return paint("± " + ", ".join(parts)[:300], "yellow")
+    if kind == "todo_list":
+        items = item.get("items") or []
+        parts = []
+        for it in items:
+            if isinstance(it, dict):
+                box = "x" if it.get("completed") else " "
+                parts.append(f"[{box}] {it.get('text', '')}")
+            else:
+                parts.append(str(it))
+        return paint("☑ " + " | ".join(parts)[:300], "blue")
+    if kind == "mcp_tool_call":
+        return paint(
+            f"⚙ {item.get('server', '?')}.{item.get('tool', '?')}", "cyan"
+        )
+    if kind == "web_search":
+        return paint(f"⌕ {item.get('query', '')}", "cyan")
+    if kind == "error":
+        msg = item.get("message", json.dumps(item))
+        if "Skill descriptions were shortened" in msg:
+            return paint("· skill descriptions shortened (Codex notice)", "dim")
+        return paint(f"✗ {msg[:400]}", "red")
+    return paint(f"· {kind} {json.dumps(item)[:200]}", "dim")
+
+
+# ---------------------------------------------------------------- commands
+
+
+def build_cmd(meta, prompt, resume_id=None):
+    """`codex exec resume` accepts neither -s nor -C, so those move into -c overrides.
+
+    MCP access is why `workspace-write` becomes `--approve-for-me`. Under a plain
+    `-s` sandbox every MCP tool call dies with "MCP tool call requires approval,
+    but approval policy is never": the tools are listed and the network is fine,
+    but nothing can approve the call in a non-interactive run. An agent that
+    cannot reach Mnemonik cannot search project memory, cannot checkpoint, and
+    cannot close the task it just finished. Three did exactly that on 2026-08-21.
+
+    `--approve-for-me` routes those approvals through automatic review and is
+    genuinely confined: verified 2026-08-21 that a write into a sibling repo
+    fails with "Read-only file system" while writes under `-C` succeed. It
+    refuses to combine with `-s`, hence the branch.
+
+    read-only keeps no MCP, and under it the agent cannot write anywhere, so
+    `codex-fleet ask` cannot reach the outbox either. That is a real cost: on
+    2026-08-21 a reviewer found two criticals and could neither checkpoint them
+    nor raise them mid-turn. Prefer `-s workspace-write --worktree` for review
+    work. The throwaway worktree is the isolation, and `-C` confines writes to
+    it, so the reviewer still cannot touch what it reviews.
+    """
+    cmd = ["codex", "exec"]
+    if resume_id:
+        cmd += ["resume", resume_id]
+    cmd += ["--json", "-m", meta["model"], "-c", f"model_reasoning_effort={meta['effort']}"]
+    if resume_id:
+        cmd += ["-c", f'sandbox_mode="{meta["sandbox"]}"']
+    elif meta["sandbox"] == "workspace-write":
+        cmd += ["--approve-for-me", "-C", meta["cwd"]]
+    else:
+        cmd += ["-s", meta["sandbox"], "-C", meta["cwd"]]
+    # The run directory is the agent's only way to speak back mid-turn. Without
+    # it, an agent that hits a blocker must burn the rest of its turn and tell
+    # you at the end, when the answer is worth nothing.
+    run_path = meta.get("run_dir")
+    if run_path:
+        cmd += ["--add-dir", run_path]
+    cmd += ["--skip-git-repo-check"]
+    for extra in meta.get("config", []):
+        cmd += ["-c", extra]
+    if meta.get("output_schema"):
+        cmd += ["--output-schema", meta["output_schema"]]
+    cmd.append(prompt)
+    return cmd
+
+
+def launch(name, meta, prompt, resume_id=None):
+    d = run_dir(name)
+    turn = meta.get("turns", 0) + 1
+    out = open(d / f"turn-{turn}.jsonl", "wb")
+    err = open(d / f"turn-{turn}.err", "wb")
+    cmd = build_cmd(meta, prompt, resume_id)
+    # The inbox hook reads CODEX_FLEET_RUN to find this run's mailbox. Without
+    # it the hook stays silent, which is also what every interactive Codex
+    # session on this machine wants.
+    child_env = dict(os.environ, CODEX_FLEET_RUN=name)
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=out,
+        stderr=err,
+        cwd=meta["cwd"],
+        env=child_env,
+        start_new_session=True,
+    )
+    meta["pid"] = proc.pid
+    meta["turns"] = turn
+    meta.setdefault("prompts", []).append({"turn": turn, "at": now(), "text": prompt})
+    save_meta(name, meta)
+    return proc, d / f"turn-{turn}.jsonl"
+
+
+def await_thread_id(events_path, timeout=60.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for ev in read_events(events_path):
+            if ev.get("type") == "thread.started":
+                return ev.get("thread_id")
+        time.sleep(0.25)
+    return None
+
+
+
+def git_root(path):
+    r = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True,
+    )
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def make_worktree(name, base_cwd):
+    """Give one agent its own checkout so concurrent writers cannot collide.
+
+    Two agents in one tree collide; the only question is whether you notice.
+    Isolation belongs to git, not to a paragraph in a brief.
+
+    A fresh worktree has no node_modules, no .env, and no built dist. A
+    read-only agent needs none of that. A writer that must RUN tests does, so
+    this links node_modules and copies .env when they exist, which covers the
+    common case without a full install.
+    """
+    root = git_root(base_cwd)
+    if not root:
+        die(f"--worktree needs a git repository; {base_cwd} is not in one")
+    wt = Path.home() / ".codex-fleet" / "worktrees" / name
+    if wt.exists():
+        die(f"worktree already exists at {wt}; pick another name or codex-fleet rm {name}")
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    branch = f"fleet/{name}"
+    r = subprocess.run(
+        ["git", "-C", root, "worktree", "add", "-b", branch, str(wt), "HEAD"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        die(f"git worktree add failed: {r.stderr.strip()}")
+
+    # Link, do not copy: node_modules is large and the agent only reads it.
+    src_modules = Path(root) / "node_modules"
+    if src_modules.is_dir() and not (wt / "node_modules").exists():
+        try:
+            os.symlink(src_modules, wt / "node_modules")
+        except OSError:
+            pass
+    for f in (".env", ".env.local"):
+        src = Path(root) / f
+        if src.is_file() and not (wt / f).exists():
+            try:
+                shutil.copy2(src, wt / f)
+                os.chmod(wt / f, 0o600)
+            except OSError:
+                pass
+    return str(wt), branch, root
+
+
+def remove_worktree(meta):
+    wt = meta.get("worktree")
+    root = meta.get("worktree_root")
+    if not wt or not root:
+        return None
+    # node_modules is a symlink into the main checkout. Remove the link first so
+    # nothing walks it and deletes the real one.
+    link = Path(wt) / "node_modules"
+    if link.is_symlink():
+        try:
+            link.unlink()
+        except OSError:
+            pass
+    r = subprocess.run(
+        ["git", "-C", root, "worktree", "remove", "--force", wt],
+        capture_output=True, text=True,
+    )
+    return r.returncode == 0
+
+
+def cmd_spawn(args):
+    if not shutil.which("codex"):
+        die("codex CLI not found on PATH")
+    name = args.name or slug(args.prompt)
+    if run_dir(name).exists() and not args.force:
+        n = 2
+        while run_dir(f"{name}-{n}").exists():
+            n += 1
+        name = f"{name}-{n}"
+    d = run_dir(name)
+    if args.force and d.exists():
+        shutil.rmtree(d)
+    d.mkdir(parents=True, exist_ok=True)
+    work_cwd = str(Path(args.cd).resolve())
+    worktree = worktree_branch = worktree_root = None
+    if getattr(args, "worktree", False):
+        worktree, worktree_branch, worktree_root = make_worktree(name, work_cwd)
+        work_cwd = worktree
+    meta = {
+        "name": name,
+        "role": args.role,
+        "model": ROLES[args.role],
+        "effort": args.effort,
+        "sandbox": args.sandbox,
+        "cwd": work_cwd,
+        "run_dir": str(d.resolve()),
+        "worktree": worktree,
+        "worktree_branch": worktree_branch,
+        "worktree_root": worktree_root,
+        "config": args.config or [],
+        "output_schema": str(Path(args.output_schema).resolve()) if args.output_schema else None,
+        "created_at": now(),
+        "turns": 0,
+        "thread_id": None,
+    }
+    save_meta(name, meta)
+    _, events_path = launch(name, meta, args.prompt)
+    thread_id = await_thread_id(events_path, timeout=args.wait_id)
+    meta = load_meta(name)
+    meta["thread_id"] = thread_id
+    save_meta(name, meta)
+    print(f"{paint(name, 'bold')}  {meta['role']}:{meta['model']}/{meta['effort']}  pid={meta['pid']}")
+    print(f"  thread {thread_id or paint('(not yet reported)', 'yellow')}")
+    print(f"  events {events_path}")
+    if worktree:
+        print(f"  worktree {worktree}  branch {worktree_branch}")
+    # Spawning is the moment new disk gets allocated, so it is the right moment
+    # to collapse the old. Silent unless it actually frees something, and it
+    # never touches a running agent or a run with a worktree still on disk.
+    if not args.no_prune:
+        auto_prune()
+
+    if args.follow:
+        cmd_watch(argparse.Namespace(name=name, verbose=args.verbose, raw=False, since=0))
+
+
+def auto_prune():
+    """Prune quietly on spawn. A workflow you have to remember is not a workflow."""
+    days = float(os.environ.get("CODEX_FLEET_PRUNE_DAYS", "3"))
+    if days <= 0:
+        return
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cmd_prune(argparse.Namespace(older_than=days, dry_run=False))
+        freed = [l for l in buf.getvalue().splitlines() if ": pruned," in l]
+        if freed:
+            total = sum(float(l.split("freed ")[1].split(" MB")[0]) for l in freed)
+            print(f"  pruned {len(freed)} run(s) older than {days:g}d, freed {total:.1f} MB")
+    except Exception:
+        # Housekeeping must never stop a spawn.
+        pass
+
+
+def cmd_list(args):
+    runs = all_runs()
+    if not runs:
+        print("no runs")
+        return
+    header = f"{'NAME':<24} {'STATUS':<9} {'ROLE':<9} {'MODEL':<15} {'EFFORT':<7} {'TURNS':<6} {'TOK(out)':<9} {'AGE':<5} LAST"
+    print(paint(header, "bold"))
+    for name, meta in runs:
+        st = status_of(name, meta)
+        events = all_events(name, meta)
+        usage = usage_of(events, meta)
+        latest = run_dir(name) / f"turn-{meta.get('turns', 1)}.jsonl"
+        msg = last_message(events, name).replace("\n", " ")[:60]
+        colour = {"running": "green", "failed": "red", "idle": "cyan"}.get(st, "dim")
+        role = meta.get("role", "-")
+        print(
+            f"{name:<24} {paint(f'{st:<9}', colour)} {role:<9} {meta['model']:<15} {meta['effort']:<7} "
+            f"{meta.get('turns', 0):<6} {usage['output_tokens']:<9} {age(latest, meta):<5} {msg}"
+        )
+
+
+def cmd_watch(args):
+    meta = load_meta(args.name)
+    seen = 0
+    idle_since = None
+    while True:
+        meta = load_meta(args.name)
+        path = run_dir(args.name) / f"turn-{meta.get('turns', 1)}.jsonl"
+        events = read_events(path)
+        for ev in events[seen:]:
+            if args.raw:
+                print(json.dumps(ev))
+            else:
+                line = describe(ev, verbose=args.verbose)
+                if line is not None:
+                    print(line)
+        seen = len(events)
+        if not alive(meta.get("pid")):
+            if idle_since is None:
+                idle_since = time.time()
+            elif time.time() - idle_since > 1.0:
+                err_path = run_dir(args.name) / f"turn-{meta.get('turns', 1)}.err"
+                if not events and err_path.exists():
+                    sys.stderr.write(err_path.read_text()[:2000])
+                break
+        else:
+            idle_since = None
+        time.sleep(0.4)
+
+
+def cmd_tail(args):
+    meta = load_meta(args.name)
+    events = all_events(args.name, meta) if args.all else read_events(
+        run_dir(args.name) / f"turn-{meta.get('turns', 1)}.jsonl"
+    )
+    for ev in events[-args.n :]:
+        if args.raw:
+            print(json.dumps(ev))
+        else:
+            line = describe(ev, verbose=args.verbose)
+            if line is not None:
+                print(line)
+
+
+def cmd_result(args):
+    """The latest turn only, so a failed turn never returns a stale earlier answer."""
+    meta = load_meta(args.name)
+    events = (
+        all_events(args.name, meta)
+        if args.all
+        else read_events(run_dir(args.name) / f"turn-{meta.get('turns', 1)}.jsonl")
+    )
+    text = last_message(events, args.name)
+    if not text:
+        st = status_of(args.name, meta)
+        err_path = run_dir(args.name) / f"turn-{meta.get('turns', 1)}.err"
+        if err_path.exists() and err_path.stat().st_size:
+            sys.stderr.write(err_path.read_text()[:2000])
+        die(f"{args.name}: no agent message in turn {meta.get('turns')} (status {st})", 2)
+    print(text)
+
+
+def cmd_say(args):
+    meta = load_meta(args.name)
+    if alive(meta.get("pid")):
+        die(f"{args.name} is still running — wait, or codex-fleet kill {args.name}", 2)
+    if not meta.get("thread_id"):
+        die(f"{args.name} has no thread id; cannot resume")
+    if args.effort:
+        meta["effort"] = args.effort
+    _, events_path = launch(args.name, meta, args.prompt, resume_id=meta["thread_id"])
+    print(f"{args.name}: turn {meta['turns']} started (pid {meta['pid']})")
+    if args.follow:
+        cmd_watch(argparse.Namespace(name=args.name, verbose=args.verbose, raw=False, since=0))
+
+
+def cmd_wait(args):
+    names = args.names or [n for n, _ in all_runs()]
+    deadline = time.time() + args.timeout if args.timeout else None
+    pending = set(names)
+    while pending:
+        for name in sorted(pending):
+            meta = load_meta(name)
+            if not alive(meta.get("pid")):
+                st = status_of(name, meta)
+                colour = "red" if st in ("failed", "stopped") else "green"
+                print(f"{name}: {paint(st, colour)}")
+                if st in ("failed", "stopped"):
+                    err_path = run_dir(name) / f"turn-{meta.get('turns', 1)}.err"
+                    if err_path.exists() and err_path.stat().st_size:
+                        for line in err_path.read_text().strip().splitlines()[:6]:
+                            print(paint(f"    {line}", "red"))
+                pending.discard(name)
+        if pending and deadline and time.time() > deadline:
+            print(f"timeout, still running: {', '.join(sorted(pending))}", file=sys.stderr)
+            sys.exit(3)
+        if pending:
+            time.sleep(1.0)
+
+
+def cmd_tell(args):
+    """Push a message into a RUNNING agent's turn.
+
+    `say` cannot do this: `codex exec` reads stdin only for the initial prompt
+    and has no channel into a turn already in flight. This writes to the run's
+    inbox instead, and the PostToolUse hook hands it to the agent on its next
+    tool call. Delivery therefore costs one tool call, not one turn.
+
+    Works whether or not the agent is running. A message left for an idle agent
+    is delivered when it next moves.
+    """
+    meta = load_meta(args.name)
+    if not meta:
+        die(f"no run named {args.name}")
+    d = run_dir(args.name)
+    d.mkdir(parents=True, exist_ok=True)
+    inbox = d / "inbox.jsonl"
+    with open(inbox, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"text": args.message, "at": now(), "read": False}) + "\n")
+    state = status_of(args.name, meta)
+    where = "on its next tool call" if state == "running" else "when it next runs"
+    print(f"queued for {args.name} ({state}); delivered {where}")
+
+
+
+def cmd_ask(args):
+    """Raise a question or a blocker WITHOUT ending your turn. Run by the agent.
+
+    The counterpart to `tell`. An agent that hits a wrong brief, a missing
+    decision, or a file another agent has claimed used to have one option: burn
+    the rest of the turn, or stop. Now it writes here and keeps working. The
+    orchestrator sees it on its next tool call and can answer with `tell`,
+    which lands on the agent's next tool call.
+
+    Reads CODEX_FLEET_RUN, so the agent never has to know its own name.
+    """
+    name = args.name or os.environ.get("CODEX_FLEET_RUN")
+    if not name:
+        die("no run name: set CODEX_FLEET_RUN, or pass one")
+    d = run_dir(name)
+    if not d.exists():
+        die(f"no run named {name}")
+    with open(d / "outbox.jsonl", "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "text": args.message,
+            "at": now(),
+            "blocking": bool(args.blocking),
+            "read": False,
+        }) + "\n")
+    if args.blocking:
+        print("raised as BLOCKING. Keep working on anything that does not depend "
+              "on the answer; check back for a reply on later tool calls.")
+    else:
+        print("raised. Keep working; a reply will reach you on a later tool call.")
+
+
+def read_outbox(name, mark_read=True):
+    """Unread agent questions, oldest first. Used by the orchestrator's hook."""
+    path = run_dir(name) / "outbox.jsonl"
+    if not path.exists():
+        return []
+    try:
+        lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    except OSError:
+        return []
+    unread, rewritten, changed = [], [], False
+    for ln in lines:
+        try:
+            msg = json.loads(ln)
+        except ValueError:
+            rewritten.append(ln)
+            continue
+        if not msg.get("read"):
+            unread.append(msg)
+            if mark_read:
+                msg["read"] = True
+                changed = True
+        rewritten.append(json.dumps(msg))
+    if changed:
+        try:
+            tmp = path.with_suffix(".jsonl.tmp")
+            tmp.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            pass
+    return unread
+
+
+def cmd_inbox(args):
+    """Show what the agents have asked. Marks them read unless --peek."""
+    names = args.names or [n for n, _ in all_runs()]
+    found = False
+    for name in names:
+        msgs = read_outbox(name, mark_read=not args.peek)
+        for m in msgs:
+            found = True
+            flag = paint("BLOCKING", "red") if m.get("blocking") else "asks"
+            print(f"{paint(name, 'bold')} {flag} [{m.get('at','')}]")
+            print(f"  {m.get('text','')}")
+    if not found:
+        print("nothing raised")
+
+
+def cmd_kill(args):
+    names = args.names or [n for n, _ in all_runs()]
+    for name in names:
+        meta = load_meta(name)
+        pid = meta.get("pid")
+        if not alive(pid):
+            print(f"{name}: not running")
+            continue
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError) as exc:
+            print(f"{name}: {exc}")
+            continue
+        print(f"{name}: terminated (pid {pid})")
+
+
+def cmd_rm(args):
+    names = args.names or []
+    if args.done:
+        names = [n for n, m in all_runs() if not alive(m.get("pid"))]
+    for name in names:
+        meta = load_meta(name)
+        if meta.get("worktree"):
+            ok = remove_worktree(meta)
+            if ok:
+                print(f"{name}: worktree removed ({meta['worktree_branch']} kept)")
+            else:
+                print(f"{name}: worktree at {meta['worktree']} could not be removed; "
+                      f"it likely holds uncommitted work")
+        d = run_dir(name)
+        if d.exists():
+            shutil.rmtree(d)
+            print(f"removed {name}")
+
+
+
+def cmd_prune(args):
+    """Collapse old runs to their conclusion instead of deleting them.
+
+    99.4% of a run's disk is its event log. The parts worth keeping are tiny:
+    the final message, the token count, and the thread id that still makes the
+    run resumable. So an old run does not need to be thrown away, it needs to
+    stop carrying the transcript of how it got there.
+
+    A pruned run keeps its place in the list, still says what it concluded, and
+    `say` still resumes it. It just costs about 6KB instead of 3MB.
+
+    Never touches a running agent, or one with a worktree still on disk.
+    """
+    cutoff = time.time() - args.older_than * 86400
+    kept = freed = touched = 0
+    for name, meta in all_runs():
+        if alive(meta.get("pid")):
+            continue
+        if meta.get("pruned_at"):
+            continue
+        if meta.get("worktree") and Path(meta["worktree"]).exists():
+            print(f"{name}: skipped, worktree still on disk")
+            continue
+        d = run_dir(name)
+        logs = [f for f in d.iterdir() if f.name.startswith("turn-")]
+        if not logs:
+            continue
+        last = max((mtime(f) for f in logs), default=0.0)
+        if last > cutoff:
+            kept += 1
+            continue
+
+        events = all_events(name, meta)
+        size = sum(f.stat().st_size for f in logs)
+        if args.dry_run:
+            days = (time.time() - last) / 86400
+            print(f"{name}: would free {size / 1024 / 1024:.1f} MB, last active {days:.1f}d ago")
+            freed += size
+            touched += 1
+            continue
+
+        # Record the conclusion BEFORE removing what produced it.
+        (d / "result.txt").write_text(last_message(events) or "", encoding="utf-8")
+        meta["final_status"] = status_of(name, meta)
+        meta["final_usage"] = usage_of(events)
+        meta["last_activity"] = last
+        meta["pruned_at"] = now()
+        save_meta(name, meta)
+        for f in logs:
+            f.unlink()
+        freed += size
+        touched += 1
+        print(f"{name}: pruned, freed {size / 1024 / 1024:.1f} MB")
+
+    verb = "would free" if args.dry_run else "freed"
+    print(f"\n{touched} run(s) {verb} {freed / 1024 / 1024:.1f} MB; "
+          f"{kept} newer than {args.older_than}d left alone")
+    if touched and not args.dry_run:
+        print("Their results and thread ids are kept, so `say` still resumes them.")
+
+
+def cmd_models(args):
+    """Only the sanctioned models and efforts, checked against the local catalog."""
+    cache = Path.home() / ".codex" / "models_cache.json"
+    catalog = {}
+    if cache.exists():
+        for m in json.loads(cache.read_text()).get("models", []):
+            catalog[m["slug"]] = [e["effort"] for e in m.get("supported_reasoning_levels") or []]
+    for role, slug_name in sorted(ROLES.items()):
+        known = catalog.get(slug_name)
+        if known is None:
+            note = paint("not in local catalog", "yellow")
+        else:
+            missing = [e for e in EFFORTS if e not in known]
+            note = paint(f"unsupported: {','.join(missing)}", "red") if missing else "ok"
+        print(f"{role:<9} {slug_name:<16} efforts={','.join(EFFORTS):<12} {note}")
+
+
+# ---------------------------------------------------------------- serve
+
+ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def plain(text):
+    return ANSI_RE.sub("", text) if text else text
+
+
+def event_kind(ev):
+    """A stable class name for the browser to colour by."""
+    t = ev.get("type")
+    if t in ("turn.failed", "error"):
+        return "fail"
+    if t in ("thread.started", "turn.started", "turn.completed"):
+        return "meta"
+    item = ev.get("item") or {}
+    kind = item.get("type", "")
+    if t != "item.completed" and kind == "command_execution":
+        return "cmd-start"
+    if kind == "agent_message":
+        return "msg"
+    if kind == "reasoning":
+        return "think"
+    if kind == "command_execution":
+        return "cmd"
+    if kind == "file_change":
+        return "file"
+    if kind == "error":
+        return "fail"
+    if kind in ("mcp_tool_call", "web_search"):
+        return "tool"
+    if kind == "todo_list":
+        return "todo"
+    return "meta"
+
+
+def run_rows():
+    rows = []
+    for name, meta in all_runs():
+        events = all_events(name, meta)
+        usage = usage_of(events, meta)
+        rows.append(
+            {
+                "name": name,
+                "status": status_of(name, meta),
+                "role": meta.get("role", "?"),
+                "model": meta.get("model", "?"),
+                "effort": meta.get("effort", "?"),
+                "sandbox": meta.get("sandbox", "?"),
+                "cwd": meta.get("cwd", ""),
+                "turns": meta.get("turns", 0),
+                "out": usage["output_tokens"],
+                "age": age(run_dir(name) / f"turn-{meta.get('turns', 1)}.jsonl", meta),
+                "ts": mtime(run_dir(name) / f"turn-{meta.get('turns', 1)}.jsonl", meta),
+                "last": plain(last_message(events, name))[:160],
+            }
+        )
+    return rows  # all_runs() already ordered by most recent activity
+
+
+def run_events(name, start, verbose):
+    meta = load_meta(name)
+    events = all_events(name, meta)
+    out = []
+    for i, ev in enumerate(events):
+        if i < start:
+            continue
+        line = describe(ev, verbose=verbose)
+        if line is None:
+            continue
+        out.append({"i": i, "kind": event_kind(ev), "text": plain(line)})
+    return {"total": len(events), "events": out, "status": status_of(name, meta)}
+
+
+SERVE_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>codex-fleet</title>
+<style>
+:root{
+  --bg:#f7f7f8; --panel:#fff; --raise:#fbfbfc;
+  --ink:#17171a; --ink2:#4a4a52; --dim:#8a8a94; --line:#e6e6ea;
+  --accent:#5b5bd6; --accent-soft:#eeeefb;
+  --run:#0f9960; --run-soft:#e6f5ee;
+  --fail:#d1383a; --fail-soft:#fbeaea;
+  --idle:#8a8a94; --idle-soft:#efeff2;
+  --msg:#0b6b45; --msg-bg:#f0f8f4; --msg-line:#8fd3b4;
+  --cmd:#2b5f8f; --think:#7d7d88; --file:#8a6212; --tool:#6d4aa8;
+  --shadow:0 1px 2px rgba(20,20,30,.05),0 4px 14px rgba(20,20,30,.05);
+}
+@media(prefers-color-scheme:dark){:root{
+  --bg:#0f0f12; --panel:#17171b; --raise:#1c1c21;
+  --ink:#eeeef2; --ink2:#b9b9c4; --dim:#7e7e8c; --line:#28282f;
+  --accent:#8b8bf0; --accent-soft:#22223a;
+  --run:#3ddc9a; --run-soft:#123027;
+  --fail:#ff7b7d; --fail-soft:#341a1c;
+  --idle:#7e7e8c; --idle-soft:#232329;
+  --msg:#6fdcaa; --msg-bg:#132720; --msg-line:#2f7a5c;
+  --cmd:#7fb6ea; --think:#82828f; --file:#e2b264; --tool:#b79cf0;
+  --shadow:0 1px 2px rgba(0,0,0,.3),0 4px 14px rgba(0,0,0,.25);
+}}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;
+  font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,"Helvetica Neue",Arial,sans-serif;
+  background:var(--bg);color:var(--ink);
+  display:grid;grid-template-columns:min(340px,32vw) 1fr;height:100vh;overflow:hidden;
+  -webkit-font-smoothing:antialiased;
+}
+#side{border-right:1px solid var(--line);overflow:auto;background:var(--panel);
+  scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+#side::-webkit-scrollbar{width:10px}
+#side::-webkit-scrollbar-thumb{background:var(--line);border-radius:99px;border:3px solid var(--panel)}
+#head{position:sticky;top:0;z-index:5;background:var(--panel);
+  padding:18px 18px 12px;border-bottom:1px solid var(--line)}
+#head h1{margin:0;font-size:15px;font-weight:650;letter-spacing:-.01em;display:flex;align-items:center;gap:9px}
+#head .count{margin-top:3px;font-size:12px;color:var(--dim)}
+.spark{width:8px;height:8px;border-radius:99px;background:var(--run);flex:0 0 auto}
+.spark.off{background:var(--dim);opacity:.45}
+#runs{padding:8px}
+.run{padding:11px 12px;border-radius:10px;cursor:pointer;margin-bottom:2px;
+  border:1px solid transparent;transition:background .12s,border-color .12s}
+.run:hover{background:var(--raise)}
+.run.sel{background:var(--accent-soft);border-color:var(--accent)}
+.run .top{display:flex;align-items:center;gap:8px;min-width:0}
+.run .nm{font-weight:600;font-size:14px;letter-spacing:-.01em;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.pill{font-size:10.5px;font-weight:650;letter-spacing:.04em;text-transform:uppercase;
+  padding:2.5px 7px;border-radius:99px;flex:0 0 auto;line-height:1.3;margin-left:auto}
+.pill.running{background:var(--run-soft);color:var(--run)}
+.pill.idle,.pill.stopped{background:var(--idle-soft);color:var(--idle)}
+.pill.failed{background:var(--fail-soft);color:var(--fail)}
+.pill.running::before{content:"";display:inline-block;width:5px;height:5px;border-radius:99px;
+  background:currentColor;margin-right:5px;vertical-align:1px;animation:pulse 1.5s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.run .meta{margin-top:5px;font-size:12px;color:var(--dim);display:flex;gap:5px;flex-wrap:wrap;align-items:center}
+.run .meta .sep{opacity:.4}
+.run .last{margin-top:6px;font-size:12.5px;color:var(--ink2);line-height:1.45;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+#main{display:flex;flex-direction:column;min-width:0;overflow:hidden;background:var(--bg)}
+#bar{padding:14px 22px;border-bottom:1px solid var(--line);background:var(--panel);
+  display:flex;gap:14px;align-items:center;flex-wrap:wrap;flex:0 0 auto}
+#title{font-size:17px;font-weight:650;letter-spacing:-.015em}
+#chips{display:flex;gap:6px;flex-wrap:wrap}
+.chip{font-size:11.5px;color:var(--ink2);background:var(--raise);border:1px solid var(--line);
+  padding:3px 9px;border-radius:7px;white-space:nowrap}
+#toggles{margin-left:auto;display:flex;gap:5px;align-items:center;flex-wrap:wrap}
+.tg{font-size:11.5px;color:var(--dim);cursor:pointer;user-select:none;padding:4px 9px;
+  border:1px solid var(--line);border-radius:7px;background:var(--panel);transition:all .12s;
+  white-space:nowrap}
+.tg:hover{border-color:var(--accent);color:var(--ink2)}
+.tg.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent);font-weight:600}
+.tg input{display:none}
+.tg .g{opacity:.65;margin-right:4px;font-family:ui-monospace,Menlo,monospace}
+#find{font:inherit;font-size:12px;padding:5px 10px;border:1px solid var(--line);border-radius:7px;
+  background:var(--panel);color:var(--ink);width:150px;transition:all .12s}
+#find:focus{outline:none;border-color:var(--accent);width:220px}
+#find::placeholder{color:var(--dim)}
+#hits{font-size:11.5px;color:var(--dim);min-width:52px}
+
+/* Filtering is class-driven so it is instant on a log of any length. */
+body.h-think .ev.think{display:none}
+body.h-cmd .ev.cmd{display:none}
+body.h-flight .ev.cmd-start{display:none}
+body.h-file .ev.file{display:none}
+body.h-tool .ev.tool{display:none}
+body.h-meta .ev.meta,body.h-meta .ev.todo{display:none}
+.ev.nomatch{display:none}
+#wrap{flex:1;position:relative;min-height:0}
+#log{height:100%;overflow:auto;padding:18px 22px 32px;
+  scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+#log::-webkit-scrollbar{width:12px}
+#log::-webkit-scrollbar-thumb{background:var(--line);border-radius:99px;border:4px solid var(--bg)}
+.ev{white-space:pre-wrap;word-break:break-word;margin:0 0 2px;padding:2px 0 2px 12px;
+  border-left:2px solid transparent;font-size:13px}
+.ev.think{color:var(--think);font-style:italic;font-size:12.5px}
+.ev.cmd,.ev.cmd-start{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  font-size:12.5px;color:var(--cmd)}
+.ev.cmd-start{opacity:.6}
+.ev.file{color:var(--file);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
+.ev.tool{color:var(--tool);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
+.ev.meta,.ev.todo{color:var(--dim);font-size:12.5px}
+.ev.msg{color:var(--msg);background:var(--msg-bg);border-left:3px solid var(--msg-line);
+  margin:12px 0;padding:11px 14px;border-radius:0 9px 9px 0;font-size:13.5px;line-height:1.6;
+  box-shadow:var(--shadow)}
+.ev.fail{color:var(--fail);background:var(--fail-soft);border-left:3px solid var(--fail);
+  margin:10px 0;padding:10px 14px;border-radius:0 9px 9px 0}
+#jump{position:absolute;right:26px;bottom:22px;padding:9px 16px;border:1px solid var(--line);
+  border-radius:99px;background:var(--panel);color:var(--ink);font:inherit;font-size:12.5px;
+  font-weight:600;cursor:pointer;box-shadow:var(--shadow);transition:all .12s}
+#jump:hover{border-color:var(--accent);color:var(--accent);transform:translateY(-1px)}
+#empty{color:var(--dim);padding:56px 22px;font-size:14px;text-align:center}
+</style></head><body>
+<div id="side">
+  <div id="head">
+    <h1><span class="spark off" id="spark"></span>codex-fleet</h1>
+    <div class="count" id="count">loading</div>
+  </div>
+  <div id="runs"></div>
+</div>
+<div id="main">
+  <div id="bar">
+    <span id="title">no run selected</span>
+    <span id="chips"></span>
+    <span id="toggles">
+      <input id="find" type="search" placeholder="filter text" autocomplete="off">
+      <span id="hits"></span>
+      <label class="tg on" data-f="think"><span class="g">~</span>reasoning</label>
+      <label class="tg on" data-f="cmd"><span class="g">$</span>commands</label>
+      <label class="tg" data-f="flight"><span class="g">&rarr;</span>in-flight</label>
+      <label class="tg on" data-f="file"><span class="g">&plusmn;</span>files</label>
+      <label class="tg on" data-f="tool"><span class="g">&#9881;</span>tools</label>
+      <label class="tg" data-f="meta"><span class="g">&middot;</span>meta</label>
+      <label class="tg" id="tg-verb"><input type="checkbox" id="verbose">output</label>
+    </span>
+  </div>
+  <div id="wrap">
+    <div id="log"><div id="empty">Pick a run on the left.</div></div>
+    <button id="jump" hidden>New events &darr;</button>
+  </div>
+</div>
+<script>
+let sel=null,next=0,verbose=false;
+const $=id=>document.getElementById(id);
+const log=$("log");
+const esc=t=>(t||"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+async function j(u){const r=await fetch(u);return r.json()}
+function pick(name){if(sel===name)return;sel=name;next=0;log.innerHTML="";log.scrollTop=0;
+$("jump").hidden=true;$("title").textContent=name;draw();poll()}
+async function draw(){
+  const runs=await j("/api/runs");
+  const live=runs.filter(r=>r.status==="running").length;
+  $("spark").className="spark"+(live?"":" off");
+  $("count").textContent=live?(live+" running of "+runs.length):(runs.length+" runs, none active");
+  $("runs").innerHTML=runs.map(function(r){
+    return '<div class="run '+(r.name===sel?"sel":"")+'" data-n="'+esc(r.name)+'">'
+      +'<div class="top"><span class="nm">'+esc(r.name)+'</span>'
+      +'<span class="pill '+r.status+'">'+r.status+'</span></div>'
+      +'<div class="meta"><span>'+esc(r.role)+'</span><span class="sep">&middot;</span>'
+      +'<span>'+esc(r.effort)+'</span><span class="sep">&middot;</span>'
+      +'<span>'+r.out.toLocaleString()+' tok</span><span class="sep">&middot;</span>'
+      +'<span>'+esc(r.age)+'</span></div>'
+      +'<div class="last">'+esc(r.last)+'</div></div>';
+  }).join("");
+  document.querySelectorAll(".run").forEach(e=>e.onclick=()=>pick(e.dataset.n));
+  const cur=runs.find(r=>r.name===sel);
+  $("chips").innerHTML=cur?[cur.model,cur.sandbox,cur.cwd].map(v=>'<span class="chip">'+esc(v)+'</span>').join(""):"";
+}
+async function poll(){
+  if(!sel)return;
+  const d=await j("/api/events?name="+encodeURIComponent(sel)+"&from="+next+"&verbose="+(verbose?1:0));
+  if(d.events&&d.events.length){
+    const e0=$("empty");if(e0)e0.remove();
+    // Measure BEFORE appending: was the reader at the bottom a moment ago?
+    const stick=atBottom();
+    for(const e of d.events){
+      const p=document.createElement("div");p.className="ev "+e.kind;p.textContent=e.text;log.appendChild(p);
+    }
+    if(needle)countHits();
+    if(stick)log.scrollTop=log.scrollHeight;else $("jump").hidden=false;
+  }
+  next=d.total;
+}
+function atBottom(){return log.scrollHeight-log.scrollTop-log.clientHeight<80}
+log.addEventListener("scroll",()=>{if(atBottom())$("jump").hidden=true});
+$("jump").onclick=()=>{log.scrollTop=log.scrollHeight;$("jump").hidden=true};
+// Each chip maps to one body class. "on" means show, so the class it toggles is
+// the hide-class, and the two defaults that start off are in-flight and meta.
+document.querySelectorAll(".tg[data-f]").forEach(function(el){
+  const f=el.dataset.f;
+  document.body.classList.toggle("h-"+f, !el.classList.contains("on"));
+  el.onclick=function(){
+    const on=el.classList.toggle("on");
+    document.body.classList.toggle("h-"+f, !on);
+    countHits();
+  };
+});
+
+const find=$("find");
+let needle="";
+function countHits(){
+  const rows=log.querySelectorAll(".ev");
+  let shown=0;
+  rows.forEach(function(r){
+    const hit=!needle||r.textContent.toLowerCase().includes(needle);
+    r.classList.toggle("nomatch",!hit);
+    if(hit&&r.offsetParent!==null)shown++;
+  });
+  $("hits").textContent=needle?(shown+" of "+rows.length):"";
+}
+find.oninput=function(){needle=find.value.trim().toLowerCase();countHits()};
+$("verbose").onchange=e=>{verbose=e.target.checked;$("tg-verb").classList.toggle("on",verbose);
+next=0;log.innerHTML="";$("jump").hidden=true;
+poll().then(()=>{log.scrollTop=log.scrollHeight})};
+draw();setInterval(draw,2000);setInterval(poll,1200);
+</script></body></html>
+"""
+
+
+def cmd_serve(args):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlparse, parse_qs
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def send_json(self, obj):
+            body = json.dumps(obj).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            u = urlparse(self.path)
+            q = parse_qs(u.query)
+            try:
+                if u.path == "/api/runs":
+                    return self.send_json(run_rows())
+                if u.path == "/api/events":
+                    name = (q.get("name") or [""])[0]
+                    start = int((q.get("from") or ["0"])[0])
+                    verbose = (q.get("verbose") or ["0"])[0] == "1"
+                    if not (run_dir(name) / "meta.json").exists():
+                        return self.send_json({"total": 0, "events": [], "status": "stopped"})
+                    return self.send_json(run_events(name, start, verbose))
+            except Exception as exc:  # a dashboard must not die on one bad run
+                return self.send_json({"error": str(exc)})
+            body = SERVE_PAGE.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    # Bind every interface: this box is worked on from other machines on the LAN.
+    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    print(f"codex-fleet dashboard on http://{lan_ip()}:{args.port}  (ctrl-c to stop)")
+    srv.serve_forever()
+
+
+def lan_ip():
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def main():
+    p = argparse.ArgumentParser(prog="codex-fleet", description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("spawn", help="start a Codex agent in the background")
+    sp.add_argument("prompt")
+    sp.add_argument("--name", "-n")
+    sp.add_argument(
+        "--role",
+        "-r",
+        default="engineer",
+        choices=sorted(ROLES),
+        help="engineer=gpt-5.6-sol (build/debug), reviewer=gpt-5.6-terra (review/critique)",
+    )
+    sp.add_argument(
+        "--effort", "-e", default="high", choices=EFFORTS,
+        help="high for ordinary work, xhigh for complex or high-risk work",
+    )
+    sp.add_argument("--sandbox", "-s", default="workspace-write", choices=SANDBOXES)
+    sp.add_argument("--cd", "-C", default=".")
+    sp.add_argument(
+        "--worktree", "-w", action="store_true",
+        help="run in a dedicated git worktree on branch fleet/<name>. Use whenever "
+             "two or more writers run at once: git enforces the split, a brief does not",
+    )
+    sp.add_argument("--config", "-c", action="append", help="extra -c key=value passed to codex")
+    sp.add_argument("--output-schema", help="JSON Schema file for the final response")
+    sp.add_argument("--force", action="store_true", help="reuse the name, wiping prior state")
+    sp.add_argument("--follow", "-f", action="store_true")
+    sp.add_argument("--verbose", "-v", action="store_true")
+    sp.add_argument("--wait-id", type=float, default=60.0)
+    sp.add_argument("--no-prune", action="store_true",
+                    help="skip the automatic prune of runs older than "
+                         "CODEX_FLEET_PRUNE_DAYS (default 3; 0 disables)")
+    sp.set_defaults(func=cmd_spawn)
+
+    lp = sub.add_parser("list", help="show every run and its status")
+    lp.set_defaults(func=cmd_list)
+
+    wp = sub.add_parser("watch", help="stream one agent's events until its turn ends")
+    wp.add_argument("name")
+    wp.add_argument("--verbose", "-v", action="store_true", help="reasoning and command output")
+    wp.add_argument("--raw", action="store_true")
+    wp.set_defaults(func=cmd_watch, since=0)
+
+    tp = sub.add_parser("tail", help="print the last N events without following")
+    tp.add_argument("name")
+    tp.add_argument("-n", type=int, default=30)
+    tp.add_argument("--all", action="store_true", help="across all turns")
+    tp.add_argument("--verbose", "-v", action="store_true")
+    tp.add_argument("--raw", action="store_true")
+    tp.set_defaults(func=cmd_tail)
+
+    rp = sub.add_parser("result", help="print the agent's latest message")
+    rp.add_argument("name")
+    rp.add_argument("--all", action="store_true", help="search earlier turns too")
+    rp.set_defaults(func=cmd_result)
+
+    yp = sub.add_parser("say", help="send a follow-up into an idle agent's session")
+    yp.add_argument("name")
+    yp.add_argument("prompt")
+    yp.add_argument("--effort", "-e", choices=EFFORTS)
+    yp.add_argument("--follow", "-f", action="store_true")
+    yp.add_argument("--verbose", "-v", action="store_true")
+    yp.set_defaults(func=cmd_say)
+
+    ap = sub.add_parser("wait", help="block until the named runs (or all) finish")
+    ap.add_argument("names", nargs="*")
+    ap.add_argument("--timeout", type=float, default=0)
+    ap.set_defaults(func=cmd_wait)
+
+    tlp = sub.add_parser("tell", help="push a message into a RUNNING agent's turn")
+    tlp.add_argument("name")
+    tlp.add_argument("message")
+    tlp.set_defaults(func=cmd_tell)
+
+    akp = sub.add_parser("ask", help="[run BY the agent] raise a question without ending the turn")
+    akp.add_argument("message")
+    akp.add_argument("--name", help="defaults to $CODEX_FLEET_RUN")
+    akp.add_argument("--blocking", action="store_true", help="the work cannot finish without an answer")
+    akp.set_defaults(func=cmd_ask)
+
+    ibp = sub.add_parser("inbox", help="show questions agents have raised")
+    ibp.add_argument("names", nargs="*")
+    ibp.add_argument("--peek", action="store_true", help="do not mark them read")
+    ibp.set_defaults(func=cmd_inbox)
+
+    pp = sub.add_parser("prune", help="collapse old runs to their result, keeping them resumable")
+    pp.add_argument("--older-than", type=float, default=3, metavar="DAYS",
+                    help="prune runs whose last activity is older than this (default 3)")
+    pp.add_argument("--dry-run", action="store_true", help="show what would go, change nothing")
+    pp.set_defaults(func=cmd_prune)
+
+    kp = sub.add_parser("kill", help="terminate running agents")
+    kp.add_argument("names", nargs="*")
+    kp.set_defaults(func=cmd_kill)
+
+    mp = sub.add_parser("rm", help="delete run state")
+    mp.add_argument("names", nargs="*")
+    mp.add_argument("--done", action="store_true", help="every run that is not running")
+    mp.set_defaults(func=cmd_rm)
+
+    op = sub.add_parser("models", help="list models and their effort levels")
+    op.add_argument("--all", action="store_true")
+    op.set_defaults(func=cmd_models)
+
+    vp = sub.add_parser("serve", help="live web dashboard for every run")
+    vp.add_argument("--port", type=int, default=8787)
+    vp.add_argument("--host", default="0.0.0.0", help="bind address; LAN-reachable by default")
+    vp.set_defaults(func=cmd_serve)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)

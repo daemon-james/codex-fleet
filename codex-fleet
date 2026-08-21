@@ -666,22 +666,45 @@ def cmd_say(args):
 
 
 def cmd_wait(args):
+    """Return as soon as ANY named run finishes. --all restores the barrier.
+
+    This used to block until every named run finished, and that is the wrong
+    default for a fleet. The orchestrator's only reliable wake-up is this
+    command exiting, so waiting on a fast agent and a slow one together made the
+    fast one's result invisible until the slow one landed. On 2026-08-21 a test
+    agent sat finished for several minutes behind a longer-running engineer, and
+    the owner noticed before the orchestrator did.
+
+    A finished agent is work to do. Return, report who is still going, and let
+    the caller re-wait for the rest.
+    """
     names = args.names or [n for n, _ in all_runs()]
     deadline = time.time() + args.timeout if args.timeout else None
     pending = set(names)
+    done = []
+
+    def report(name, meta):
+        st = status_of(name, meta)
+        colour = "red" if st in ("failed", "stopped") else "green"
+        print(f"{name}: {paint(st, colour)}")
+        if st in ("failed", "stopped"):
+            err_path = run_dir(name) / f"turn-{meta.get('turns', 1)}.err"
+            if err_path.exists() and err_path.stat().st_size:
+                for line in err_path.read_text().strip().splitlines()[:6]:
+                    print(paint(f"    {line}", "red"))
+
     while pending:
         for name in sorted(pending):
             meta = load_meta(name)
             if not alive(meta.get("pid")):
-                st = status_of(name, meta)
-                colour = "red" if st in ("failed", "stopped") else "green"
-                print(f"{name}: {paint(st, colour)}")
-                if st in ("failed", "stopped"):
-                    err_path = run_dir(name) / f"turn-{meta.get('turns', 1)}.err"
-                    if err_path.exists() and err_path.stat().st_size:
-                        for line in err_path.read_text().strip().splitlines()[:6]:
-                            print(paint(f"    {line}", "red"))
+                report(name, meta)
+                done.append(name)
                 pending.discard(name)
+        if done and not args.all:
+            if pending:
+                print(f"still running: {', '.join(sorted(pending))}")
+                print(f"  wait again with: codex-fleet wait {' '.join(sorted(pending))}")
+            return
         if pending and deadline and time.time() > deadline:
             print(f"timeout, still running: {', '.join(sorted(pending))}", file=sys.stderr)
             sys.exit(3)
@@ -1330,9 +1353,11 @@ def main():
     yp.add_argument("--verbose", "-v", action="store_true")
     yp.set_defaults(func=cmd_say)
 
-    ap = sub.add_parser("wait", help="block until the named runs (or all) finish")
+    ap = sub.add_parser("wait", help="block until the FIRST named run finishes")
     ap.add_argument("names", nargs="*")
     ap.add_argument("--timeout", type=float, default=0)
+    ap.add_argument("--all", action="store_true",
+                    help="wait for every named run instead of returning on the first")
     ap.set_defaults(func=cmd_wait)
 
     tlp = sub.add_parser("tell", help="push a message into a RUNNING agent's turn")

@@ -61,9 +61,13 @@ kill $(pgrep -f "^python3 .*codex-fleet serve")
 codex-fleet serve --port 8787 --host 0.0.0.0 &
 ```
 
-Use `pgrep -f "^python3 .*codex-fleet serve"`, not `pkill -f "codex-fleet
-serve"`. The loose pattern matches the shell running the command and kills your
-own session. That happened twice.
+**Anchor every `pgrep`/`pkill` pattern.** `pkill -f "codex-fleet serve"` matches
+the shell running that very command and kills your own session. Use
+`pgrep -f "^python3 .*codex-fleet serve"`. This is not a `serve` problem, it is
+true of any pattern you match against a process list from inside a shell whose
+command line contains the pattern. It has now cost three sessions, the third
+being `pgrep -f "codex-fleet wait <names>"` written by someone who had already
+documented the rule.
 
 ## Traps
 
@@ -123,6 +127,16 @@ is invisible until somebody calls `say`, and then the whole turn dies before the
 model sees the prompt, with `unexpected argument '--add-dir' found` buried in
 `turn-N.err`. **If you add anything to the spawn command, check the resume path
 in the same edit.**
+
+**`wait` returns on the FIRST completion, and that default is deliberate.** The
+orchestrator's only reliable wake-up is this command exiting. It used to block
+until every named run finished, so waiting on a fast agent and a slow one
+together hid the fast one's result behind the slow one. A test agent once sat
+finished for minutes behind a longer engineer and the owner noticed before the
+orchestrator did. `--all` restores the barrier for the rare case that wants it.
+The status hook is only a safety net here: it fires on a tool call or a turn
+boundary, so it cannot reach an orchestrator that has ended its turn and is
+waiting on nothing else.
 
 **A run's env var is set at spawn and cannot be retrofitted.** `CODEX_FLEET_RUN`
 is the only thing that tells the inbox hook which mailbox to read. An agent

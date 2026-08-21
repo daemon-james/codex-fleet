@@ -1004,92 +1004,113 @@ def run_events(name, start, verbose):
     return {"total": len(events), "events": out, "status": status_of(name, meta)}
 
 
-SERVE_PAGE = """<!doctype html>
+SERVE_PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>codex-fleet</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 :root{
-  --bg:#f7f7f8; --panel:#fff; --raise:#fbfbfc;
-  --ink:#17171a; --ink2:#4a4a52; --dim:#8a8a94; --line:#e6e6ea;
-  --accent:#5b5bd6; --accent-soft:#eeeefb;
-  --run:#0f9960; --run-soft:#e6f5ee;
-  --fail:#d1383a; --fail-soft:#fbeaea;
-  --idle:#8a8a94; --idle-soft:#efeff2;
-  --msg:#0b6b45; --msg-bg:#f0f8f4; --msg-line:#8fd3b4;
-  --cmd:#2b5f8f; --think:#7d7d88; --file:#8a6212; --tool:#6d4aa8;
-  --shadow:0 1px 2px rgba(20,20,30,.05),0 4px 14px rgba(20,20,30,.05);
+  --bg:#f3f4f6; --panel:#ffffff; --raise:#f8f9fa; --sunk:#eceef1;
+  --ink:#15191f; --ink2:#434b55; --dim:#7b848f; --faint:#a7aeb7; --line:#e1e4e8; --line2:#cfd4da;
+  --accent:#2f6fed; --accent-soft:#e9f0fe; --accent-ink:#1d4fb8;
+  --run:#16865a; --run-soft:#e3f4ec;
+  --fail:#cc3a36; --fail-soft:#fcebea;
+  --idle:#7b848f; --idle-soft:#eef0f2;
+  --cmd:#2e5f8a; --file:#8a5a12; --tool:#6b4fb5; --think:#6f7782;
+  --code-bg:#f1f3f5; --pre-bg:#f6f7f9;
+  --shadow:0 1px 2px rgba(16,20,28,.04),0 6px 20px rgba(16,20,28,.05);
+  --sans:"IBM Plex Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,"Helvetica Neue",Arial,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
 }
 @media(prefers-color-scheme:dark){:root{
-  --bg:#0f0f12; --panel:#17171b; --raise:#1c1c21;
-  --ink:#eeeef2; --ink2:#b9b9c4; --dim:#7e7e8c; --line:#28282f;
-  --accent:#8b8bf0; --accent-soft:#22223a;
-  --run:#3ddc9a; --run-soft:#123027;
-  --fail:#ff7b7d; --fail-soft:#341a1c;
-  --idle:#7e7e8c; --idle-soft:#232329;
-  --msg:#6fdcaa; --msg-bg:#132720; --msg-line:#2f7a5c;
-  --cmd:#7fb6ea; --think:#82828f; --file:#e2b264; --tool:#b79cf0;
-  --shadow:0 1px 2px rgba(0,0,0,.3),0 4px 14px rgba(0,0,0,.25);
+  --bg:#0f1114; --panel:#16191d; --raise:#1b1f24; --sunk:#111316;
+  --ink:#e8ebee; --ink2:#b4bbc4; --dim:#7f8893; --faint:#5b636d; --line:#252a31; --line2:#343b44;
+  --accent:#6c9cf5; --accent-soft:#1a2540; --accent-ink:#9dbdfa;
+  --run:#3fcf8e; --run-soft:#132b21;
+  --fail:#ff7a75; --fail-soft:#33191b;
+  --idle:#7f8893; --idle-soft:#20242a;
+  --cmd:#7fb3e6; --file:#e0b15d; --tool:#b9a2f3; --think:#8b949f;
+  --code-bg:#22272e; --pre-bg:#1b2026;
+  --shadow:0 1px 2px rgba(0,0,0,.35),0 6px 20px rgba(0,0,0,.3);
 }}
+
+/* Type scale follows the viewport so a 4K monitor gets a larger base than a
+   laptop, and everything below is in rem so one number moves the whole page. */
+html{font-size:clamp(15px,0.4vw + 10px,20px)}
 *{box-sizing:border-box}
 html,body{height:100%}
 body{
-  margin:0;
-  font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,"Helvetica Neue",Arial,sans-serif;
+  margin:0;font-family:var(--sans);font-size:1rem;line-height:1.6;
   background:var(--bg);color:var(--ink);
-  display:grid;grid-template-columns:min(340px,32vw) 1fr;height:100vh;overflow:hidden;
-  -webkit-font-smoothing:antialiased;
+  display:grid;grid-template-columns:clamp(300px,22vw,460px) 1fr;height:100vh;overflow:hidden;
+  -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
 }
+button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:6px}
+
+/* ---- sidebar ---- */
 #side{border-right:1px solid var(--line);overflow:auto;background:var(--panel);
-  scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+  scrollbar-width:thin;scrollbar-color:var(--line2) transparent;display:flex;flex-direction:column}
 #side::-webkit-scrollbar{width:10px}
-#side::-webkit-scrollbar-thumb{background:var(--line);border-radius:99px;border:3px solid var(--panel)}
+#side::-webkit-scrollbar-thumb{background:var(--line2);border-radius:99px;border:3px solid var(--panel)}
 #head{position:sticky;top:0;z-index:5;background:var(--panel);
-  padding:18px 18px 12px;border-bottom:1px solid var(--line)}
-#head h1{margin:0;font-size:15px;font-weight:650;letter-spacing:-.01em;display:flex;align-items:center;gap:9px}
-#head .count{margin-top:3px;font-size:12px;color:var(--dim)}
-.spark{width:8px;height:8px;border-radius:99px;background:var(--run);flex:0 0 auto}
-.spark.off{background:var(--dim);opacity:.45}
-#runs{padding:8px}
-.run{padding:11px 12px;border-radius:10px;cursor:pointer;margin-bottom:2px;
+  padding:1.4rem 1.4rem 1rem;border-bottom:1px solid var(--line)}
+#head h1{margin:0;font-size:1.05rem;font-weight:600;letter-spacing:-.01em;display:flex;align-items:center;gap:.6rem}
+#head .count{margin-top:.2rem;font-size:.85rem;color:var(--dim)}
+.spark{width:.55rem;height:.55rem;border-radius:99px;background:var(--run);flex:0 0 auto;
+  box-shadow:0 0 0 .25rem var(--run-soft)}
+.spark.off{background:var(--faint);box-shadow:none}
+#runs{padding:.6rem .8rem 1.5rem}
+.grp{font-size:.72rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);
+  padding:1rem .6rem .45rem}
+.grp:first-child{padding-top:.5rem}
+.run{display:block;width:100%;text-align:left;padding:.75rem .85rem;border-radius:.7rem;margin-bottom:.15rem;
   border:1px solid transparent;transition:background .12s,border-color .12s}
 .run:hover{background:var(--raise)}
-.run.sel{background:var(--accent-soft);border-color:var(--accent)}
-.run .top{display:flex;align-items:center;gap:8px;min-width:0}
-.run .nm{font-weight:600;font-size:14px;letter-spacing:-.01em;overflow:hidden;
+.run.sel{background:var(--accent-soft);border-color:transparent}
+.run .top{display:flex;align-items:center;gap:.5rem;min-width:0}
+.run .nm{font-weight:600;font-size:.98rem;letter-spacing:-.005em;overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap;min-width:0}
-.pill{font-size:10.5px;font-weight:650;letter-spacing:.04em;text-transform:uppercase;
-  padding:2.5px 7px;border-radius:99px;flex:0 0 auto;line-height:1.3;margin-left:auto}
+.pill{font-size:.7rem;font-weight:600;letter-spacing:.05em;text-transform:uppercase;
+  padding:.15rem .5rem;border-radius:99px;flex:0 0 auto;line-height:1.5;margin-left:auto;
+  display:inline-flex;align-items:center;gap:.35rem}
 .pill.running{background:var(--run-soft);color:var(--run)}
 .pill.idle,.pill.stopped{background:var(--idle-soft);color:var(--idle)}
 .pill.failed{background:var(--fail-soft);color:var(--fail)}
-.pill.running::before{content:"";display:inline-block;width:5px;height:5px;border-radius:99px;
-  background:currentColor;margin-right:5px;vertical-align:1px;animation:pulse 1.5s ease-in-out infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.run .meta{margin-top:5px;font-size:12px;color:var(--dim);display:flex;gap:5px;flex-wrap:wrap;align-items:center}
-.run .meta .sep{opacity:.4}
-.run .last{margin-top:6px;font-size:12.5px;color:var(--ink2);line-height:1.45;
+.pill.running::before{content:"";width:.4rem;height:.4rem;border-radius:99px;
+  background:currentColor;animation:pulse 1.6s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+.run .meta{margin-top:.3rem;font-size:.8rem;color:var(--dim);display:flex;gap:.4rem;flex-wrap:wrap;
+  font-variant-numeric:tabular-nums}
+.run .meta .sep{color:var(--faint)}
+.run .last{margin-top:.35rem;font-size:.86rem;color:var(--ink2);line-height:1.45;
   display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.run.sel .last{color:var(--ink)}
+
+/* ---- main column ---- */
 #main{display:flex;flex-direction:column;min-width:0;overflow:hidden;background:var(--bg)}
-#bar{padding:14px 22px;border-bottom:1px solid var(--line);background:var(--panel);
-  display:flex;gap:14px;align-items:center;flex-wrap:wrap;flex:0 0 auto}
-#title{font-size:17px;font-weight:650;letter-spacing:-.015em}
-#chips{display:flex;gap:6px;flex-wrap:wrap}
-.chip{font-size:11.5px;color:var(--ink2);background:var(--raise);border:1px solid var(--line);
-  padding:3px 9px;border-radius:7px;white-space:nowrap}
-#toggles{margin-left:auto;display:flex;gap:5px;align-items:center;flex-wrap:wrap}
-.tg{font-size:11.5px;color:var(--dim);cursor:pointer;user-select:none;padding:4px 9px;
-  border:1px solid var(--line);border-radius:7px;background:var(--panel);transition:all .12s;
-  white-space:nowrap}
-.tg:hover{border-color:var(--accent);color:var(--ink2)}
-.tg.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent);font-weight:600}
-.tg input{display:none}
-.tg .g{opacity:.65;margin-right:4px;font-family:ui-monospace,Menlo,monospace}
-#find{font:inherit;font-size:12px;padding:5px 10px;border:1px solid var(--line);border-radius:7px;
-  background:var(--panel);color:var(--ink);width:150px;transition:all .12s}
-#find:focus{outline:none;border-color:var(--accent);width:220px}
-#find::placeholder{color:var(--dim)}
-#hits{font-size:11.5px;color:var(--dim);min-width:52px}
+#bar{padding:1.4rem 2.5rem 0;background:var(--panel);border-bottom:1px solid var(--line);flex:0 0 auto}
+#ident{display:flex;align-items:baseline;gap:.9rem;flex-wrap:wrap}
+#title{font-size:1.45rem;font-weight:600;letter-spacing:-.02em;line-height:1.25}
+#ident .pill{margin-left:0;align-self:center}
+#facts{display:flex;gap:1.6rem 2.2rem;flex-wrap:wrap;margin-top:.9rem;min-height:1.2rem}
+.fact{display:flex;flex-direction:column;gap:.05rem;min-width:0}
+.fact .k{font-size:.7rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--dim)}
+.fact .v{font-size:.92rem;color:var(--ink2);font-variant-numeric:tabular-nums;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;max-width:34rem}
+.fact .v.mono{font-family:var(--mono);font-size:.86rem}
+#tools{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;padding:1rem 0 1rem;margin-top:.6rem;
+  border-top:1px solid var(--line)}
+#tools .lbl{font-size:.78rem;color:var(--dim);margin-right:.1rem}
+.tg{font-size:.82rem;color:var(--dim);user-select:none;padding:.3rem .7rem;
+  border:1px solid var(--line);border-radius:99px;background:var(--panel);transition:all .12s;white-space:nowrap;
+  display:inline-flex;align-items:center;gap:.4rem}
+.tg:hover{border-color:var(--line2);color:var(--ink2)}
+.tg[aria-pressed="true"]{background:var(--accent-soft);border-color:transparent;color:var(--accent-ink);font-weight:500}
+.tg .g{font-family:var(--mono);font-size:.8rem;opacity:.8}
 
 /* Filtering is class-driven so it is instant on a log of any length. */
 body.h-think .ev.think{display:none}
@@ -1098,31 +1119,77 @@ body.h-flight .ev.cmd-start{display:none}
 body.h-file .ev.file{display:none}
 body.h-tool .ev.tool{display:none}
 body.h-meta .ev.meta,body.h-meta .ev.todo{display:none}
-.ev.nomatch{display:none}
+
+/* ---- stream ---- */
 #wrap{flex:1;position:relative;min-height:0}
-#log{height:100%;overflow:auto;padding:18px 22px 32px;
-  scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+#log{height:100%;overflow:auto;padding:2rem 2.5rem 4rem;scrollbar-width:thin;scrollbar-color:var(--line2) transparent}
 #log::-webkit-scrollbar{width:12px}
-#log::-webkit-scrollbar-thumb{background:var(--line);border-radius:99px;border:4px solid var(--bg)}
-.ev{white-space:pre-wrap;word-break:break-word;margin:0 0 2px;padding:2px 0 2px 12px;
-  border-left:2px solid transparent;font-size:13px}
-.ev.think{color:var(--think);font-style:italic;font-size:12.5px}
-.ev.cmd,.ev.cmd-start{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-  font-size:12.5px;color:var(--cmd)}
-.ev.cmd-start{opacity:.6}
-.ev.file{color:var(--file);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
-.ev.tool{color:var(--tool);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
-.ev.meta,.ev.todo{color:var(--dim);font-size:12.5px}
-.ev.msg{color:var(--msg);background:var(--msg-bg);border-left:3px solid var(--msg-line);
-  margin:12px 0;padding:11px 14px;border-radius:0 9px 9px 0;font-size:13.5px;line-height:1.6;
-  box-shadow:var(--shadow)}
-.ev.fail{color:var(--fail);background:var(--fail-soft);border-left:3px solid var(--fail);
-  margin:10px 0;padding:10px 14px;border-radius:0 9px 9px 0}
-#jump{position:absolute;right:26px;bottom:22px;padding:9px 16px;border:1px solid var(--line);
-  border-radius:99px;background:var(--panel);color:var(--ink);font:inherit;font-size:12.5px;
-  font-weight:600;cursor:pointer;box-shadow:var(--shadow);transition:all .12s}
-#jump:hover{border-color:var(--accent);color:var(--accent);transform:translateY(-1px)}
-#empty{color:var(--dim);padding:56px 22px;font-size:14px;text-align:center}
+#log::-webkit-scrollbar-thumb{background:var(--line2);border-radius:99px;border:4px solid var(--bg)}
+#stream{max-width:96ch}
+.ev{display:grid;grid-template-columns:1.6rem minmax(0,1fr);column-gap:.6rem;margin:0;padding:.12rem 0}
+.ev .g{font-family:var(--mono);font-size:.8rem;text-align:center;color:var(--faint);line-height:1.75;user-select:none}
+.ev .t{min-width:0;white-space:pre-wrap;word-break:break-word;font-size:.88rem;color:var(--ink2);line-height:1.6}
+.ev.think .g{color:var(--think)}
+.ev.think .t{color:var(--think);font-size:.88rem}
+.ev.think .t.md{white-space:normal}
+.ev.cmd .t,.ev.cmd-start .t,.ev.file .t,.ev.tool .t{font-family:var(--mono);font-size:.82rem;line-height:1.65}
+.ev.cmd .g,.ev.cmd .t{color:var(--cmd)}
+.ev.cmd .t .out{display:block;color:var(--dim);margin-top:.15rem}
+.ev.cmd-start .g,.ev.cmd-start .t{color:var(--cmd);opacity:.55}
+.ev.file .g,.ev.file .t{color:var(--file)}
+.ev.tool .g,.ev.tool .t{color:var(--tool)}
+.ev.meta .t,.ev.todo .t{color:var(--dim);font-size:.82rem}
+.ev .x{display:inline-block;font-family:var(--sans);font-size:.68rem;font-weight:600;letter-spacing:.04em;
+  color:var(--fail);background:var(--fail-soft);border-radius:99px;padding:0 .45rem;margin-left:.5rem;vertical-align:.1em}
+.ev.fail{margin:.6rem 0}
+.ev.fail .g{color:var(--fail)}
+.ev.fail .t{color:var(--fail);background:var(--fail-soft);border-radius:.6rem;padding:.6rem .9rem}
+
+/* The agent's own words are the thing being read, so they get the page's
+   body size, a card, and room around them. Everything else is activity. */
+.ev.msg{margin:1.1rem 0 1.3rem}
+.ev.msg .g{color:var(--accent);font-size:.9rem;line-height:1.9}
+.ev.msg .t{white-space:normal;font-size:1rem;color:var(--ink);background:var(--panel);
+  border:1px solid var(--line);border-radius:.9rem;padding:1.1rem 1.4rem 1.2rem;box-shadow:var(--shadow);
+  line-height:1.65;max-width:82ch}
+.md>:first-child{margin-top:0}
+.md>:last-child{margin-bottom:0}
+.md p{margin:0 0 .8em}
+.md h1,.md h2,.md h3,.md h4,.md h5,.md h6{line-height:1.3;margin:1.3em 0 .5em;font-weight:600;letter-spacing:-.01em;color:var(--ink)}
+.md h1{font-size:1.3em}.md h2{font-size:1.18em}.md h3{font-size:1.06em}.md h4,.md h5,.md h6{font-size:1em}
+.md ul,.md ol{margin:.3em 0 .9em;padding-left:1.6em}
+.md li{margin:.25em 0}
+.md li>p{margin:.35em 0}
+.md li>ul,.md li>ol{margin:.3em 0 .4em}
+.md code{font-family:var(--mono);font-size:.86em;background:var(--code-bg);border-radius:.3em;padding:.05em .3em;color:var(--ink)}
+.md pre{font-family:var(--mono);font-size:.84em;line-height:1.55;background:var(--pre-bg);border:1px solid var(--line);
+  border-radius:.6rem;padding:.9em 1.1em;overflow-x:auto;margin:.7em 0 1em;white-space:pre}
+.md pre code{background:none;padding:0;font-size:1em;border-radius:0}
+.md blockquote{margin:.7em 0 1em;padding:.2em 0 .2em 1em;border-left:3px solid var(--line2);color:var(--ink2)}
+.md a{color:var(--accent-ink);text-decoration:underline;text-decoration-color:var(--line2);text-underline-offset:.15em}
+.md a:hover{text-decoration-color:currentColor}
+.md a.path{font-family:var(--mono);font-size:.86em;text-decoration:none;background:var(--code-bg);border-radius:.35em;padding:.1em .4em}
+.md hr{border:0;border-top:1px solid var(--line);margin:1.2em 0}
+.md table{border-collapse:collapse;margin:.7em 0 1em;font-size:.92em;display:block;overflow-x:auto;max-width:100%}
+.md th,.md td{border:1px solid var(--line);padding:.4em .8em;text-align:left;vertical-align:top}
+.md th{background:var(--raise);font-weight:600}
+.md strong{font-weight:600;color:var(--ink)}
+.md .chk{font-family:var(--mono);color:var(--dim);margin-right:.3em}
+
+#jump{position:absolute;right:2.5rem;bottom:1.6rem;padding:.55rem 1.1rem;border:1px solid var(--line);
+  border-radius:99px;background:var(--panel);color:var(--ink);font-size:.86rem;
+  font-weight:500;box-shadow:var(--shadow);transition:all .12s}
+#jump:hover{border-color:var(--accent);color:var(--accent-ink);transform:translateY(-1px)}
+#empty{color:var(--dim);padding:6rem 2rem;font-size:1rem;text-align:center;max-width:36rem;margin:0 auto;line-height:1.6}
+#empty b{color:var(--ink2);font-weight:600}
+
+@media(prefers-reduced-motion:reduce){.pill.running::before{animation:none}#jump{transition:none}}
+@media(max-width:860px){
+  body{grid-template-columns:1fr;grid-template-rows:40vh 1fr}
+  #side{border-right:0;border-bottom:1px solid var(--line)}
+  #bar,#log{padding-left:1.2rem;padding-right:1.2rem}
+  #jump{right:1.2rem}
+}
 </style></head><body>
 <div id="side">
   <div id="head">
@@ -1133,51 +1200,161 @@ body.h-meta .ev.meta,body.h-meta .ev.todo{display:none}
 </div>
 <div id="main">
   <div id="bar">
-    <span id="title">no run selected</span>
-    <span id="chips"></span>
-    <span id="toggles">
-      <input id="find" type="search" placeholder="filter text" autocomplete="off">
-      <span id="hits"></span>
-      <label class="tg on" data-f="think"><span class="g">~</span>reasoning</label>
-      <label class="tg on" data-f="cmd"><span class="g">$</span>commands</label>
-      <label class="tg" data-f="flight"><span class="g">&rarr;</span>in-flight</label>
-      <label class="tg on" data-f="file"><span class="g">&plusmn;</span>files</label>
-      <label class="tg on" data-f="tool"><span class="g">&#9881;</span>tools</label>
-      <label class="tg" data-f="meta"><span class="g">&middot;</span>meta</label>
-      <label class="tg" id="tg-verb"><input type="checkbox" id="verbose">output</label>
-    </span>
+    <div id="ident"><span id="title">No run selected</span><span id="status"></span></div>
+    <div id="facts"></div>
+    <div id="tools">
+      <span class="lbl">Show</span>
+      <button class="tg" data-f="think" aria-pressed="true"><span class="g">~</span>reasoning</button>
+      <button class="tg" data-f="cmd" aria-pressed="true"><span class="g">$</span>commands</button>
+      <button class="tg" data-f="flight" aria-pressed="false"><span class="g">&rarr;</span>in flight</button>
+      <button class="tg" data-f="file" aria-pressed="true"><span class="g">&plusmn;</span>file edits</button>
+      <button class="tg" data-f="tool" aria-pressed="true"><span class="g">&#9881;</span>tool calls</button>
+      <button class="tg" data-f="meta" aria-pressed="false"><span class="g">&middot;</span>turn markers</button>
+      <button class="tg" id="tg-verb" aria-pressed="false"><span class="g">&#8801;</span>full output</button>
+    </div>
   </div>
   <div id="wrap">
-    <div id="log"><div id="empty">Pick a run on the left.</div></div>
-    <button id="jump" hidden>New events &darr;</button>
+    <div id="log"><div id="stream"><div id="empty"><b>Pick a run</b> from the list to follow its stream. Agent messages render as text; commands, edits and tool calls sit between them as quiet lines you can hide.</div></div></div>
+    <button id="jump" hidden>Newer events &darr;</button>
   </div>
 </div>
 <script>
 let sel=null,next=0,verbose=false;
 const $=id=>document.getElementById(id);
-const log=$("log");
-const esc=t=>(t||"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const log=$("log"),stream=$("stream");
+const esc=t=>(t||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 async function j(u){const r=await fetch(u);return r.json()}
-function pick(name){if(sel===name)return;sel=name;next=0;log.innerHTML="";log.scrollTop=0;
-$("jump").hidden=true;$("title").textContent=name;draw();poll()}
+
+/* ---- markdown: enough for what an agent writes, nothing more ---- */
+function inline(s){
+  const code=[];
+  s=esc(s).replace(/`([^`]+)`/g,function(_,c){code.push(c);return "\u0000"+(code.length-1)+"\u0000"});
+  s=s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g,function(_,t,u){
+    const path=/^\/|^\.{1,2}\//.test(u)?" class=\"path\"":"";
+    return "<a"+path+" href=\""+u+"\">"+t+"</a>"});
+  s=s.replace(/(^|\s)(https?:\/\/[^\s<]+)/g,"$1<a href=\"$2\">$2</a>");
+  s=s.replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>");
+  s=s.replace(/(^|[^*\w])\*([^*\s][^*]*?)\*(?=[^*\w]|$)/g,"$1<em>$2</em>");
+  s=s.replace(/(^|[^\w])_([^_\s][^_]*?)_(?=[^\w]|$)/g,"$1<em>$2</em>");
+  return s.replace(/\u0000(\d+)\u0000/g,function(_,i){return "<code>"+code[+i]+"</code>"});
+}
+const ITEM=/^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
+function md(src){
+  const lines=src.replace(/\r/g,"").split("\n");
+  const out=[],para=[];let i=0,m;
+  function flush(){if(para.length){out.push("<p>"+inline(para.join(" "))+"</p>");para.length=0}}
+  while(i<lines.length){
+    const l=lines[i];
+    if(/^\s*```/.test(l)){flush();const buf=[];i++;
+      while(i<lines.length&&!/^\s*```/.test(lines[i])){buf.push(lines[i]);i++}
+      i++;out.push("<pre><code>"+esc(buf.join("\n"))+"</code></pre>");continue}
+    if((m=/^(#{1,6})\s+(.*)$/.exec(l))){flush();const n=m[1].length;
+      out.push("<h"+n+">"+inline(m[2].replace(/\s+#+\s*$/,""))+"</h"+n+">");i++;continue}
+    if(/^\s*([-*_])(\s*\1){2,}\s*$/.test(l)){flush();out.push("<hr>");i++;continue}
+    if(/^\s*>/.test(l)){flush();const buf=[];
+      while(i<lines.length&&/^\s*>/.test(lines[i])){buf.push(lines[i].replace(/^\s*>\s?/,""));i++}
+      out.push("<blockquote>"+md(buf.join("\n"))+"</blockquote>");continue}
+    if(ITEM.test(l)){flush();const r=list(lines,i);out.push(r.html);i=r.next;continue}
+    if(/^\s*\|.*\|\s*$/.test(l)&&i+1<lines.length&&/^\s*\|?\s*:?-{2,}/.test(lines[i+1])){
+      flush();const r=table(lines,i);out.push(r.html);i=r.next;continue}
+    if(!l.trim()){flush();i++;continue}
+    para.push(l.trim());i++;
+  }
+  flush();return out.join("");
+}
+function list(lines,i){
+  const first=ITEM.exec(lines[i]);
+  const indent=first[1].length,ordered=/\d/.test(first[2]),tag=ordered?"ol":"ul";
+  const start=ordered?parseInt(first[2],10):1;
+  const items=[];let cur=null;
+  while(i<lines.length){
+    const l=lines[i],mm=ITEM.exec(l);
+    if(mm&&mm[1].length===indent&&/\d/.test(mm[2])===ordered){cur=[mm[3]];items.push(cur);i++;continue}
+    if(mm&&mm[1].length<=indent)break;
+    if(!l.trim()){
+      let k=i+1;while(k<lines.length&&!lines[k].trim())k++;
+      if(k<lines.length){const ind=/^\s*/.exec(lines[k])[0].length,isItem=ITEM.test(lines[k]);
+        if(ind>indent||(isItem&&ind===indent)){if(cur)cur.push("");i=k;continue}}
+      break;
+    }
+    const ind=/^\s*/.exec(l)[0].length;
+    if(ind<indent)break;
+    if(!cur)break;
+    const body=indent+first[2].length+1;
+    cur.push(ind>=body?l.slice(body):l.trim());i++;
+  }
+  const html=items.map(function(it){
+    let h=md(it.join("\n").replace(/^\[([ xX])\]\s+/,function(_,c){return "\u0001"+(c===" "?"0":"1")+"\u0001 "}));
+    if(/^<p>[^]*<\/p>$/.test(h)&&h.indexOf("<p>",1)<0)h=h.slice(3,-4);
+    h=h.replace(/\u0001([01])\u0001/g,function(_,c){return "<span class=\"chk\">"+(c==="1"?"&#9745;":"&#9744;")+"</span>"});
+    return "<li>"+h+"</li>"}).join("");
+  const attr=ordered&&start!==1?" start=\""+start+"\"":"";
+  return {html:"<"+tag+attr+">"+html+"</"+tag+">",next:i};
+}
+function cells(l){return l.trim().replace(/^\|/,"").replace(/\|$/,"").split("|").map(c=>c.trim())}
+function table(lines,i){
+  const head=cells(lines[i]);i+=2;const rows=[];
+  while(i<lines.length&&/^\s*\|/.test(lines[i])){rows.push(cells(lines[i]));i++}
+  const h="<thead><tr>"+head.map(c=>"<th>"+inline(c)+"</th>").join("")+"</tr></thead>";
+  const b="<tbody>"+rows.map(r=>"<tr>"+r.map(c=>"<td>"+inline(c)+"</td>").join("")+"</tr>").join("")+"</tbody>";
+  return {html:"<table>"+h+b+"</table>",next:i};
+}
+
+/* ---- one event row ---- */
+const LEAD=/^(▸|~|→|±|☑|⚙|⌕|✗|·|\$(\[\d+\])?)\s?/;
+function row(e){
+  const div=document.createElement("div");div.className="ev "+e.kind;
+  let text=e.text||"",glyph="",exit="";
+  const m=LEAD.exec(text);
+  if(m){glyph=m[1];text=text.slice(m[0].length);
+    if(m[2]){exit=m[2].slice(1,-1);glyph="$"}}
+  const g=document.createElement("span");g.className="g";g.textContent=glyph;
+  const t=document.createElement("div");t.className="t";
+  if(e.kind==="msg"||e.kind==="think"){t.className="t md";t.innerHTML=md(text)}
+  else if(e.kind==="cmd"){
+    const nl=text.indexOf("\n");
+    if(nl<0)t.textContent=text;
+    else{t.textContent=text.slice(0,nl);const o=document.createElement("span");o.className="out";
+      o.textContent=text.slice(nl+1).replace(/^ {4}/gm,"");t.appendChild(o)}
+    if(exit){const x=document.createElement("span");x.className="x";x.textContent="exit "+exit;t.insertBefore(x,t.firstChild.nextSibling)}
+  }
+  else t.textContent=text;
+  div.appendChild(g);div.appendChild(t);return div;
+}
+
+/* ---- sidebar and header ---- */
+const plainMd=s=>(s||"").replace(/[*_`#>]/g,"").replace(/\[([^\]]+)\]\([^)]*\)/g,"$1");
+function pick(name){if(sel===name)return;sel=name;next=0;stream.innerHTML="";log.scrollTop=0;
+  $("jump").hidden=true;$("title").textContent=name;draw();poll()}
+function fact(k,v,mono){return "<div class=\"fact\"><span class=\"k\">"+k+"</span><span class=\"v"+(mono?" mono":"")+"\" title=\""+esc(v)+"\">"+esc(v)+"</span></div>"}
 async function draw(){
   const runs=await j("/api/runs");
-  const live=runs.filter(r=>r.status==="running").length;
-  $("spark").className="spark"+(live?"":" off");
-  $("count").textContent=live?(live+" running of "+runs.length):(runs.length+" runs, none active");
-  $("runs").innerHTML=runs.map(function(r){
-    return '<div class="run '+(r.name===sel?"sel":"")+'" data-n="'+esc(r.name)+'">'
-      +'<div class="top"><span class="nm">'+esc(r.name)+'</span>'
-      +'<span class="pill '+r.status+'">'+r.status+'</span></div>'
-      +'<div class="meta"><span>'+esc(r.role)+'</span><span class="sep">&middot;</span>'
-      +'<span>'+esc(r.effort)+'</span><span class="sep">&middot;</span>'
-      +'<span>'+r.out.toLocaleString()+' tok</span><span class="sep">&middot;</span>'
-      +'<span>'+esc(r.age)+'</span></div>'
-      +'<div class="last">'+esc(r.last)+'</div></div>';
-  }).join("");
+  const live=runs.filter(r=>r.status==="running");
+  $("spark").className="spark"+(live.length?"":" off");
+  $("count").textContent=live.length?(live.length+" running, "+runs.length+" total"):(runs.length+" runs, none active");
+  const card=function(r){
+    return "<button class=\"run "+(r.name===sel?"sel":"")+"\" data-n=\""+esc(r.name)+"\">"
+      +"<div class=\"top\"><span class=\"nm\">"+esc(r.name)+"</span>"
+      +"<span class=\"pill "+r.status+"\">"+r.status+"</span></div>"
+      +"<div class=\"meta\"><span>"+esc(r.role)+"</span><span class=\"sep\">&middot;</span>"
+      +"<span>"+esc(r.effort)+"</span><span class=\"sep\">&middot;</span>"
+      +"<span>"+r.out.toLocaleString()+" tok</span><span class=\"sep\">&middot;</span>"
+      +"<span>"+esc(r.age)+"</span></div>"
+      +"<div class=\"last\">"+esc(plainMd(r.last))+"</div></button>";
+  };
+  const rest=runs.filter(r=>r.status!=="running");
+  let html="";
+  if(live.length)html+="<div class=\"grp\">Running ("+live.length+")</div>"+live.map(card).join("");
+  if(rest.length)html+="<div class=\"grp\">Finished ("+rest.length+")</div>"+rest.map(card).join("");
+  $("runs").innerHTML=html;
   document.querySelectorAll(".run").forEach(e=>e.onclick=()=>pick(e.dataset.n));
   const cur=runs.find(r=>r.name===sel);
-  $("chips").innerHTML=cur?[cur.model,cur.sandbox,cur.cwd].map(v=>'<span class="chip">'+esc(v)+'</span>').join(""):"";
+  $("status").innerHTML=cur?"<span class=\"pill "+cur.status+"\">"+cur.status+"</span>":"";
+  $("facts").innerHTML=cur?[
+    fact("Role",cur.role),fact("Model",cur.model,true),fact("Effort",cur.effort),
+    fact("Sandbox",cur.sandbox,true),fact("Turns",String(cur.turns)),
+    fact("Output",cur.out.toLocaleString()+" tokens"),fact("Last activity",cur.age+" ago"),
+    fact("Directory",cur.cwd,true)].join(""):"";
 }
 async function poll(){
   if(!sel)return;
@@ -1186,10 +1363,7 @@ async function poll(){
     const e0=$("empty");if(e0)e0.remove();
     // Measure BEFORE appending: was the reader at the bottom a moment ago?
     const stick=atBottom();
-    for(const e of d.events){
-      const p=document.createElement("div");p.className="ev "+e.kind;p.textContent=e.text;log.appendChild(p);
-    }
-    if(needle)countHits();
+    for(const e of d.events)stream.appendChild(row(e));
     if(stick)log.scrollTop=log.scrollHeight;else $("jump").hidden=false;
   }
   next=d.total;
@@ -1197,34 +1371,20 @@ async function poll(){
 function atBottom(){return log.scrollHeight-log.scrollTop-log.clientHeight<80}
 log.addEventListener("scroll",()=>{if(atBottom())$("jump").hidden=true});
 $("jump").onclick=()=>{log.scrollTop=log.scrollHeight;$("jump").hidden=true};
-// Each chip maps to one body class. "on" means show, so the class it toggles is
-// the hide-class, and the two defaults that start off are in-flight and meta.
+// Each toggle maps to one body class. Pressed means show, so the class it
+// toggles is the hide-class; in-flight and turn markers start hidden.
 document.querySelectorAll(".tg[data-f]").forEach(function(el){
   const f=el.dataset.f;
-  document.body.classList.toggle("h-"+f, !el.classList.contains("on"));
+  document.body.classList.toggle("h-"+f,el.getAttribute("aria-pressed")!=="true");
   el.onclick=function(){
-    const on=el.classList.toggle("on");
-    document.body.classList.toggle("h-"+f, !on);
-    countHits();
+    const on=el.getAttribute("aria-pressed")!=="true";
+    el.setAttribute("aria-pressed",on?"true":"false");
+    document.body.classList.toggle("h-"+f,!on);
   };
 });
-
-const find=$("find");
-let needle="";
-function countHits(){
-  const rows=log.querySelectorAll(".ev");
-  let shown=0;
-  rows.forEach(function(r){
-    const hit=!needle||r.textContent.toLowerCase().includes(needle);
-    r.classList.toggle("nomatch",!hit);
-    if(hit&&r.offsetParent!==null)shown++;
-  });
-  $("hits").textContent=needle?(shown+" of "+rows.length):"";
-}
-find.oninput=function(){needle=find.value.trim().toLowerCase();countHits()};
-$("verbose").onchange=e=>{verbose=e.target.checked;$("tg-verb").classList.toggle("on",verbose);
-next=0;log.innerHTML="";$("jump").hidden=true;
-poll().then(()=>{log.scrollTop=log.scrollHeight})};
+$("tg-verb").onclick=function(){verbose=!verbose;this.setAttribute("aria-pressed",verbose?"true":"false");
+  next=0;stream.innerHTML="";$("jump").hidden=true;
+  poll().then(()=>{log.scrollTop=log.scrollHeight})};
 draw();setInterval(draw,2000);setInterval(poll,1200);
 </script></body></html>
 """

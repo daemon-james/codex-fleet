@@ -8,7 +8,9 @@ of backslash-quote, which is invalid JavaScript, in a file that still imported
 and ran fine. Python cannot catch it and neither can a syntax check.
 
 So dashboard.html is the source of truth and this tool is the only thing that
-writes the string. Edit the HTML, run this, done.
+writes the string. Edit the HTML, run this, done. The string is a raw literal
+(r-prefixed), so the page may use backslashes in its JavaScript; the read-back
+check below is what proves the bytes survived.
 
     tools/embed-page.py            # embed, verify, report
     tools/embed-page.py --check    # verify only, non-zero if they differ
@@ -22,7 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PAGE = ROOT / "dashboard.html"
 CLI = ROOT / "codex-fleet"
-MARKER = 'SERVE_PAGE = """'
+MARKER = 'SERVE_PAGE = r"""'
 
 
 def extract(source: str) -> str:
@@ -35,15 +37,16 @@ def main() -> int:
     check_only = "--check" in sys.argv
     page = PAGE.read_text(encoding="utf-8")
 
-    # A triple quote would end the string early; a backslash is the mangling
-    # this tool exists to prevent. Refuse rather than produce a broken CLI.
+    # A triple quote would end the raw string early, and a raw string cannot
+    # end in a backslash. Refuse rather than produce a broken CLI.
     if '"""' in page:
         print("dashboard.html contains a triple quote, which cannot be embedded", file=sys.stderr)
         return 2
-    if "\\" in page:
-        print("dashboard.html contains a backslash. Write the page so it needs none:",
-              file=sys.stderr)
-        print("  use double quotes in JS, and string concatenation over templates",
+    if any(ord(c) < 9 for c in page):
+        print("dashboard.html contains a control character; write the JS escape instead", file=sys.stderr)
+        return 2
+    if page.rstrip("\n").endswith("\\") or page.endswith("\\"):
+        print("dashboard.html ends with a backslash, which would escape the closing quote",
               file=sys.stderr)
         return 2
 

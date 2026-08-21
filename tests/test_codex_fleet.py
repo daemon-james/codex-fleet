@@ -460,8 +460,10 @@ class CodexFleetTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_embedded_dashboard_contains_no_backslash(self):
-        self.assertNotIn("\\", cf.SERVE_PAGE)
+    def test_embedded_dashboard_is_byte_identical_to_source(self):
+        page = (ROOT / "dashboard.html").read_text(encoding="utf-8")
+        self.assertEqual(cf.SERVE_PAGE, page)
+        self.assertNotIn('"""', page)
 
     def test_command_events_use_distinct_started_and_completed_classes(self):
         started = {

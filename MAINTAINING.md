@@ -77,8 +77,9 @@ heredoc mangled every quote in the JavaScript: 86 occurrences of
 backslash-quote, invalid JS, in a file that still imported and passed
 `ast.parse` cleanly. Python cannot catch it. That is why `dashboard.html` is the
 source of truth and `tools/embed-page.py` is the only thing that writes the
-string. It refuses a page containing a backslash or a triple quote, and reads
-its own output back to confirm it survived.
+string. The string is a raw literal (`r"""`), so the page's JavaScript may use
+backslashes; the tool refuses a triple quote, a control character, or a
+trailing backslash, and reads its own output back to confirm it survived.
 
 **Sort keys must stop moving.** Sorting runs by last-event time reads correctly
 and behaves terribly: a live agent rewrites its log every second, so two running

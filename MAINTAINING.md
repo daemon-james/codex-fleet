@@ -129,6 +129,13 @@ model sees the prompt, with `unexpected argument '--add-dir' found` buried in
 `turn-N.err`. **If you add anything to the spawn command, check the resume path
 in the same edit.**
 
+**`result` warns when agents are running unwatched, because `wait` returning
+on the first completion means you have to re-issue it and you will forget.** It
+fires on reading a result, which is always the step just before the mistake:
+read, report, end the turn, and the remaining agents finish into silence. It
+prints nothing when a live `wait` already names them. Do not remove it without
+replacing the habit it stands in for.
+
 **`wait` returns on the FIRST completion, and that default is deliberate.** The
 orchestrator's only reliable wake-up is this command exiting. It used to block
 until every named run finished, so waiting on a fast agent and a slow one

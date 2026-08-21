@@ -646,6 +646,43 @@ def cmd_tail(args):
                 print(line)
 
 
+def warn_if_unwatched(exclude=None):
+    """Say so when agents are running and nothing is waiting on them.
+
+    `wait` returns on the FIRST completion, so covering a fan-out means
+    re-issuing it every time. That is a workflow that depends on the
+    orchestrator remembering, and MAINTAINING.md is explicit that such a
+    workflow is not a workflow. On 2026-08-21 the ball was dropped this way
+    repeatedly: read a result, report it, end the turn, and the remaining agents
+    finished into silence.
+
+    Reading a result is always what precedes that mistake, so this fires there.
+    It costs one pgrep and prints nothing when a wait is already up.
+    """
+    running = [n for n, m in all_runs() if alive(m.get("pid")) and n != exclude]
+    if not running:
+        return
+    try:
+        watched = subprocess.run(
+            ["pgrep", "-af", r"codex-fleet wait"], capture_output=True, text=True
+        ).stdout
+    except OSError:
+        watched = ""
+    # Any live `wait` naming a running run counts as covered.
+    if any(name in watched for name in running):
+        return
+    names = " ".join(sorted(running))
+    print(
+        paint(
+            f"\n  {len(running)} agent(s) running with nothing waiting on them: {names}\n"
+            f"  background this or they finish into silence:\n"
+            f"    codex-fleet wait {names}",
+            "yellow",
+        ),
+        file=sys.stderr,
+    )
+
+
 def cmd_result(args):
     """The latest turn only, so a failed turn never returns a stale earlier answer."""
     meta = load_meta(args.name)
@@ -662,6 +699,7 @@ def cmd_result(args):
             sys.stderr.write(err_path.read_text()[:2000])
         die(f"{args.name}: no agent message in turn {meta.get('turns')} (status {st})", 2)
     print(text)
+    warn_if_unwatched(exclude=args.name)
 
 
 def refresh_worktree(meta):

@@ -534,5 +534,68 @@ class CodexFleetTests(unittest.TestCase):
         self.assertIn("boom: the agent died", out)
 
 
+    # ------------------------------------------------- unwatched-agent warning
+    #
+    # `wait` returns on the first completion, so covering a fan-out means
+    # re-issuing it. Forgetting that is how finished agents go unread. The
+    # warning fires where the mistake actually happens, on reading a result.
+
+    def test_result_warns_when_a_running_agent_has_no_wait(self):
+        self._make_run("still-going", pid=os.getpid())
+        buf = io.StringIO()
+        with mock.patch.object(cf.subprocess, "run",
+                               return_value=mock.Mock(stdout="")) as ran:
+            with contextlib.redirect_stderr(buf):
+                cf.warn_if_unwatched()
+        self.assertIn("still-going", buf.getvalue())
+        self.assertIn("codex-fleet wait still-going", buf.getvalue())
+        self.assertTrue(ran.called)
+
+    def test_result_stays_quiet_when_a_wait_already_names_the_run(self):
+        self._make_run("still-going", pid=os.getpid())
+        buf = io.StringIO()
+        with mock.patch.object(
+            cf.subprocess, "run",
+            return_value=mock.Mock(stdout="4321 codex-fleet wait still-going\n"),
+        ):
+            with contextlib.redirect_stderr(buf):
+                cf.warn_if_unwatched()
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_result_stays_quiet_when_nothing_is_running(self):
+        self._make_run("finished", pid=None)
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            cf.warn_if_unwatched()
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_the_run_being_read_does_not_warn_about_itself(self):
+        self._make_run("just-read", pid=os.getpid())
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            cf.warn_if_unwatched(exclude="just-read")
+        self.assertEqual(buf.getvalue(), "")
+
+
+    def test_reading_a_result_actually_runs_the_unwatched_check(self):
+        # The four tests above call warn_if_unwatched directly, so they pass
+        # even if cmd_result never calls it. This one pins the wiring, which is
+        # the part that failed in practice: the check existing is worth nothing
+        # if reading a result does not reach it.
+        self._make_run(
+            "answered",
+            pid=None,
+            turns=[[
+                {"type": "item.completed",
+                 "item": {"type": "agent_message", "text": "done"}},
+                {"type": "turn.completed", "usage": {}},
+            ]],
+        )
+        with mock.patch.object(cf, "warn_if_unwatched") as checked:
+            with contextlib.redirect_stdout(io.StringIO()):
+                cf.cmd_result(argparse.Namespace(name="answered", all=False))
+        checked.assert_called_once_with(exclude="answered")
+
+
 if __name__ == "__main__":
     unittest.main()

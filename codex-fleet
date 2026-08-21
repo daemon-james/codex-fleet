@@ -365,9 +365,18 @@ def build_cmd(meta, prompt, resume_id=None):
     # The run directory is the agent's only way to speak back mid-turn. Without
     # it, an agent that hits a blocker must burn the rest of its turn and tell
     # you at the end, when the answer is worth nothing.
+    #
+    # `codex exec resume` rejects --add-dir the same way it rejects -s and -C,
+    # so the resume path sets the same thing through config. Getting this wrong
+    # is silent until someone calls `say`, and then the whole turn dies with
+    # "unexpected argument '--add-dir' found".
     run_path = meta.get("run_dir")
     if run_path:
-        cmd += ["--add-dir", run_path]
+        if resume_id:
+            roots = json.dumps([run_path, meta["cwd"]])
+            cmd += ["-c", f"sandbox_workspace_write.writable_roots={roots}"]
+        else:
+            cmd += ["--add-dir", run_path]
     cmd += ["--skip-git-repo-check"]
     for extra in meta.get("config", []):
         cmd += ["-c", extra]

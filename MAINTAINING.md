@@ -115,6 +115,15 @@ channel into a turn in flight. `tell` goes around it by writing
 reverse, and works because `build_cmd` passes `--add-dir <run_dir>` so the
 sandbox lets the agent write there.
 
+**`codex exec resume` takes almost no flags, and fails loudly but late.** It
+rejects `-s`, `-C` and `--add-dir`. `build_cmd` therefore branches: the spawn
+path uses flags, the resume path passes the same settings through `-c`
+(`sandbox_mode`, `sandbox_workspace_write.writable_roots`). Getting this wrong
+is invisible until somebody calls `say`, and then the whole turn dies before the
+model sees the prompt, with `unexpected argument '--add-dir' found` buried in
+`turn-N.err`. **If you add anything to the spawn command, check the resume path
+in the same edit.**
+
 **A run's env var is set at spawn and cannot be retrofitted.** `CODEX_FLEET_RUN`
 is the only thing that tells the inbox hook which mailbox to read. An agent
 started before that wiring existed can never receive a `tell`. If you add

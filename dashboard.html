@@ -173,8 +173,9 @@ body.h-meta .ev.meta,body.h-meta .ev.todo{display:none}
   border-radius:99px;background:var(--panel);color:var(--ink);font-size:.86rem;
   font-weight:500;box-shadow:var(--shadow);transition:all .12s}
 #jump:hover{border-color:var(--accent);color:var(--accent-ink);transform:translateY(-1px)}
-#empty{color:var(--dim);padding:6rem 0;font-size:1rem;max-width:36rem;line-height:1.6}
-#empty b{color:var(--ink2);font-weight:600}
+#empty{color:var(--dim);padding:5rem 0;font-size:1rem;line-height:1.6}
+#empty code{font-family:var(--mono);font-size:.9em;color:var(--ink2)}
+body.none #tools{display:none}
 
 @media(prefers-reduced-motion:reduce){.pill.running::before{animation:none}#jump{transition:none}}
 @media(max-width:860px){
@@ -194,7 +195,7 @@ body.h-meta .ev.meta,body.h-meta .ev.todo{display:none}
 </div>
 <div id="main">
   <div id="bar">
-    <div id="ident"><span id="title">No run selected</span><span id="status"></span></div>
+    <div id="ident"><span id="title">codex-fleet</span><span id="status"></span></div>
     <div id="facts"></div>
     <div id="tools">
       <span class="lbl">Show</span>
@@ -207,7 +208,7 @@ body.h-meta .ev.meta,body.h-meta .ev.todo{display:none}
     </div>
   </div>
   <div id="wrap">
-    <div id="log"><div id="stream"><div id="empty"><b>Pick a run</b> from the list to follow its stream. Agent messages render as text; commands, edits and tool calls sit between them as quiet lines you can hide.</div></div></div>
+    <div id="log"><div id="stream"><div id="empty">No runs yet. Spawn one with <code>codex-fleet spawn</code> and it appears here.</div></div></div>
     <button id="jump" hidden>Newer events &darr;</button>
   </div>
 </div>
@@ -322,6 +323,8 @@ function pick(name){if(sel===name)return;sel=name;next=0;stream.innerHTML="";log
 function fact(k,v,mono){return "<div class=\"fact\"><span class=\"k\">"+k+"</span><span class=\"v"+(mono?" mono":"")+"\" title=\""+esc(v)+"\">"+esc(v)+"</span></div>"}
 async function draw(){
   const runs=await j("/api/runs");
+  if(!sel&&runs.length){sel=runs[0].name;$("title").textContent=sel;poll()}
+  document.body.classList.toggle("none",!runs.length);
   const live=runs.filter(r=>r.status==="running");
   $("spark").className="spark"+(live.length?"":" off");
   $("count").textContent=live.length?(live.length+" running, "+runs.length+" total"):(runs.length+" runs, none active");

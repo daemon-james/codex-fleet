@@ -359,6 +359,18 @@ def build_cmd(meta, prompt, resume_id=None):
     cmd += ["--json", "-m", meta["model"], "-c", f"model_reasoning_effort={meta['effort']}"]
     if resume_id:
         cmd += ["-c", f'sandbox_mode="{meta["sandbox"]}"']
+        # KNOWN LIMITATION, do not "fix" this without testing a real resume.
+        # resume rejects --approve-for-me, so a resumed agent falls back to the
+        # user's approval_policy ("never") and every MCP call dies with "MCP
+        # tool call requires approval, but approval policy is never". Proven
+        # 2026-08-21: one agent answered "Succeeded." on its spawn turn and hit
+        # that error on its resume turn.
+        # approval_policy="granular" is NOT the answer. It parses on spawn but
+        # resume rejects it with "invalid type: unit variant, expected newtype
+        # variant", so it wants a value rather than a bare string. Tried and
+        # reverted rather than shipped broken.
+        # Until the right key is found: tell a resumed agent to put findings in
+        # its final message, and checkpoint on its behalf.
     elif meta["sandbox"] == "workspace-write":
         cmd += ["--approve-for-me", "-C", meta["cwd"]]
     else:

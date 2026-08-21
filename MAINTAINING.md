@@ -139,6 +139,21 @@ The status hook is only a safety net here: it fires on a tool call or a turn
 boundary, so it cannot reach an orchestrator that has ended its turn and is
 waiting on nothing else.
 
+**A resumed agent loses its Mnemonik.** `codex exec resume` rejects
+`--approve-for-me`, so it falls back to the user's `approval_policy` (`never`)
+and every MCP call dies with "MCP tool call requires approval, but approval
+policy is never". Proven by running one agent twice: it answered "Succeeded."
+on its spawn turn and hit that error on the resume turn.
+
+`approval_policy="granular"` is NOT the fix. It parses on spawn but resume
+rejects it with "invalid type: unit variant, expected newtype variant", meaning
+it wants a value rather than a bare string. That was tried and reverted rather
+than shipped broken; do not re-try it without testing an actual resume.
+
+Until the right key is found, tell a resumed agent to put findings in its final
+message and checkpoint on its behalf. The turn still works, it just cannot
+remember anything itself.
+
 **A run's env var is set at spawn and cannot be retrofitted.** `CODEX_FLEET_RUN`
 is the only thing that tells the inbox hook which mailbox to read. An agent
 started before that wiring existed can never receive a `tell`. If you add

@@ -1113,6 +1113,13 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:poin
   display:inline-flex;align-items:center;gap:.4rem}
 .tg:hover{border-color:var(--line2);color:var(--ink2)}
 .tg[aria-pressed="true"]{background:var(--accent-soft);border-color:transparent;color:var(--accent-ink);font-weight:500}
+/* A pressed toggle wears the colour of the rows it controls. */
+.tg[data-f="think"][aria-pressed="true"]{background:var(--think-soft);color:var(--think)}
+.tg[data-f="cmd"][aria-pressed="true"]{background:var(--cmd-soft);color:var(--cmd)}
+.tg[data-f="file"][aria-pressed="true"]{background:var(--file-soft);color:var(--file)}
+.tg[data-f="tool"][aria-pressed="true"]{background:var(--tool-soft);color:var(--tool)}
+.tg[data-f="meta"][aria-pressed="true"]{background:var(--idle-soft);color:var(--ink2)}
+.tg[aria-pressed="true"] .g{opacity:1}
 .tg .g{font-family:var(--mono);font-size:.8rem;opacity:.8}
 
 /* Filtering is class-driven so it is instant on a log of any length. */

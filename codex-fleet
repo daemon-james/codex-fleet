@@ -617,6 +617,10 @@ def cmd_spawn(args):
         "model": ROLES[args.role],
         "effort": args.effort,
         "sandbox": "danger-full-access",
+        # 0 means "no turn read yet". The Stop hook blocks ending the turn while
+        # turns > result_read_turn on an idle run. Runs that predate this field
+        # are exempt; see the hook.
+        "result_read_turn": 0,
         "cwd": work_cwd,
         "run_dir": str(d.resolve()),
         "worktree": worktree,
@@ -778,6 +782,11 @@ def warn_if_unwatched(exclude=None):
 def cmd_result(args):
     """The latest turn only, so a failed turn never returns a stale earlier answer."""
     meta = load_meta(args.name)
+    # Reading a result is what proves the work was looked at. The Stop hook
+    # blocks ending the turn while a finished agent's latest turn is unread.
+    if meta and not alive(meta.get("pid")) and meta.get("result_read_turn") != meta.get("turns", 0):
+        meta["result_read_turn"] = meta.get("turns", 0)
+        save_meta(args.name, meta)
     events = (
         all_events(args.name, meta)
         if args.all
@@ -868,6 +877,40 @@ def cmd_say(args):
         cmd_watch(argparse.Namespace(name=args.name, verbose=args.verbose, raw=False, since=0))
 
 
+def warn_if_orphaned():
+    """Say so when this wait's exit will wake nobody.
+
+    From Claude Code a wait only matters if it runs as a tracked background
+    Bash task, which puts a `claude` process in its ancestry. Started with a
+    shell `&`, it is reparented to PID 1 when its shell exits, returns on the
+    first completion, and nothing is notified. Three dropped threads on
+    2026-08-22 had exactly that shape. Orchestration should not use wait at
+    all now: arm `codex-fleet events` once as a persistent Monitor instead.
+    """
+    pid = os.getpid()
+    seen = 0
+    while pid and pid != 1 and seen < 32:
+        seen += 1
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+                stat = fh.read()
+            comm = stat[stat.index("(") + 1 : stat.rindex(")")]
+            pid = int(stat[stat.rindex(")") + 2 :].split()[1])
+        except (OSError, ValueError, IndexError):
+            return
+        if comm == "claude":
+            return
+    print(
+        paint(
+            "  this wait has no claude ancestor, so nothing will be woken when it returns.\n"
+            "  From Claude Code, arm the fleet connection once instead:\n"
+            '  Monitor({ command: "codex-fleet events", persistent: true, description: "codex fleet" })',
+            "yellow",
+        ),
+        file=sys.stderr,
+    )
+
+
 def cmd_wait(args):
     """Return as soon as ANY named run finishes. --all restores the barrier.
 
@@ -885,6 +928,7 @@ def cmd_wait(args):
     deadline = time.time() + args.timeout if args.timeout else None
     pending = set(names)
     done = []
+    warn_if_orphaned()
 
     def report(name, meta):
         st = status_of(name, meta)
@@ -1077,6 +1121,80 @@ def read_outbox(name, mark_read=True, include_unanswered_blocking=False):
         except OSError:
             pass
     return unread
+
+
+EVENTS_POLL_SECONDS = 2
+EVENTS_STALL_BUCKETS = (600, 1800, 3600)
+
+
+def cmd_events(args):
+    """One line per fleet event, forever. The inbound half of the connection.
+
+    Arm it ONCE per orchestrator session as a persistent Monitor:
+
+        Monitor({ command: "codex-fleet events", persistent: true,
+                  description: "codex fleet" })
+
+    Every line it prints becomes a notification that reaches the orchestrator
+    whether it is idle or mid-turn, so nothing has to be re-armed and no
+    command has to be remembered after the first one. `wait` is for humans and
+    scripts; orchestration does not need it once this is running.
+
+    Events: started, finished (with the first line of the result and the
+    command to read it), FAILED, stopped, ASKING (a blocking question, once per
+    question), stalled (no event for 10/30/60 minutes, once per bucket). On
+    start it prints one line per run that is running, so a fresh session knows
+    the state it inherited.
+
+    Lines are flushed individually; a poll that fails is skipped, never fatal.
+    """
+    seen = {}
+    asked = set()
+    first = True
+    while True:
+        try:
+            for name, meta in all_runs():
+                st = status_of(name, meta)
+                prev = seen.get(name)
+                latest = run_dir(name) / f"turn-{meta.get('turns', 1)}.jsonl"
+                quiet = time.time() - (mtime(latest, meta) or time.time())
+                role = meta.get("role", "?")
+
+                if first:
+                    if st == "running":
+                        print(f"running {name} ({role}), {int(quiet // 60)}m since last event", flush=True)
+                elif prev is None and st == "running":
+                    print(f"started {name} ({role})", flush=True)
+                elif prev and prev["status"] == "running" and st != "running":
+                    verb = {"idle": "finished", "failed": "FAILED", "stopped": "stopped without completing"}.get(st, st)
+                    msg = last_message(read_events(latest), name).replace("\n", " ")[:160]
+                    print(f"{verb} {name} ({role}): {msg}  ->  codex-fleet result {name}", flush=True)
+
+                for q in unanswered_blocking(name):
+                    key = (name, q.get("at"))
+                    if key not in asked:
+                        asked.add(key)
+                        print(
+                            f"ASKING {name}: {q.get('text', '').strip()[:300]}  ->  codex-fleet tell {name} \"<answer>\"",
+                            flush=True,
+                        )
+
+                bucket = 0
+                if st == "running":
+                    for b in EVENTS_STALL_BUCKETS:
+                        if quiet >= b:
+                            bucket = b
+                if bucket and bucket > (prev or {}).get("stall", 0):
+                    print(
+                        f"stalled {name} ({role}): no event for {bucket // 60} minutes  ->  codex-fleet tail {name} -n 15, or kill it",
+                        flush=True,
+                    )
+                seen[name] = {"status": st, "stall": bucket if st == "running" else 0}
+            first = False
+        except Exception:
+            # A bad poll is skipped. The stream must outlive any single error.
+            pass
+        time.sleep(EVENTS_POLL_SECONDS)
 
 
 def cmd_inbox(args):
@@ -1872,6 +1990,8 @@ def main():
     akp.add_argument("--blocking", action="store_true", help="the work cannot finish without an answer")
     akp.set_defaults(func=cmd_ask)
 
+    ev = sub.add_parser("events", help="one line per fleet event, forever; arm once as a persistent Monitor")
+    ev.set_defaults(func=cmd_events)
     ibp = sub.add_parser("inbox", help="show questions agents have raised")
     ibp.add_argument("names", nargs="*")
     ibp.add_argument("--peek", action="store_true", help="do not mark them read")

@@ -134,22 +134,35 @@ model sees the prompt, with `unexpected argument '--add-dir' found` buried in
 `turn-N.err`. **If you add anything to the spawn command, check the resume path
 in the same edit.**
 
-**`result` warns when agents are running unwatched, because `wait` returning
-on the first completion means you have to re-issue it and you will forget.** It
-fires on reading a result, which is always the step just before the mistake:
-read, report, end the turn, and the remaining agents finish into silence. It
-prints nothing when a live `wait` already names them. Do not remove it without
-replacing the habit it stands in for.
+**The fleet connection is one persistent Monitor, armed once per session.**
+`codex-fleet events` prints one line per fleet event forever: started, finished
+(with the first line of the result and the command to read it), FAILED,
+stopped, ASKING (a blocking question, once), stalled (10/30/60 min, once per
+bucket). On start it prints the runs it inherited. From Claude Code:
 
-**`wait` returns on the FIRST completion, and that default is deliberate.** The
-orchestrator's only reliable wake-up is this command exiting. It used to block
-until every named run finished, so waiting on a fast agent and a slow one
-together hid the fast one's result behind the slow one. A test agent once sat
-finished for minutes behind a longer engineer and the owner noticed before the
-orchestrator did. `--all` restores the barrier for the rare case that wants it.
-The status hook is only a safety net here: it fires on a tool call or a turn
-boundary, so it cannot reach an orchestrator that has ended its turn and is
-waiting on nothing else.
+    Monitor({ command: "codex-fleet events", persistent: true, description: "codex fleet" })
+
+Every line reaches the orchestrator as a notification whether it is idle or
+mid-turn, so nothing is re-armed and no command is remembered. The outbound
+half is `codex-fleet tell`, which the agent's PostToolUse hook delivers on its
+next tool call. That is the whole connection.
+
+This replaced a workflow built on `wait`, which returns on the first completion
+and had to be re-issued every time. It was dropped four times in two days, three
+of them the same way: started with a shell `&`, orphaned to PID 1 when the shell
+exited, visible to pgrep and observed by nobody. `wait` stays for humans and
+scripts; it warns on stderr when it has no `claude` ancestor.
+
+**Coverage means observed, and the Stop hook enforces it.** Both hooks count a
+`codex-fleet events` or `wait` process as coverage only when a live `claude`
+process is in its ancestry (walked through /proc) and its CODEX_FLEET_HOME is
+this fleet's. `hooks/codex-fleet-stop.py` blocks the orchestrator ending its
+turn while any agent is running with no observed coverage, or while any idle
+agent's latest turn has never been read with `codex-fleet result`, and says
+exactly what to run. It honours `stop_hook_active`, so it corrects once per
+stop and can never loop. Runs that predate `result_read_turn` are exempt,
+because 44 historical runs tripped the first dry run and a run nobody recorded
+reading cannot be proven unread.
 
 **Do not sandbox the agents tighter than the user's own config.** This machine's
 `~/.codex/config.toml` sets `sandbox_mode = "danger-full-access"` and

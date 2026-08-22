@@ -45,13 +45,14 @@ echo "codex-fleet from $ROOT"
 link "$ROOT/codex-fleet"                  "$HOME/.local/bin/codex-fleet"              "cli" || rc=1
 link "$ROOT/hooks/codex-fleet-inbox.py"   "$HOME/.codex/hooks/codex-fleet-inbox.py"   "codex inbox hook" || rc=1
 link "$ROOT/hooks/codex-fleet-status.py"  "$HOME/.claude/hooks/codex-fleet-status.py" "claude status hook" || rc=1
+link "$ROOT/hooks/codex-fleet-stop.py"    "$HOME/.claude/hooks/codex-fleet-stop.py"   "claude stop hook" || rc=1
 
 echo
 echo "Hook registration is NOT done here, because both hosts gate it:"
 echo "  Codex  ~/.codex/hooks.json   PostToolUse -> codex-fleet-inbox.py"
 echo "         Codex asks the owner to trust a new hook once. Until they do,"
 echo "         'codex-fleet tell' is queued but never delivered."
-echo "  Claude ~/.claude/settings.json  PostToolUse + UserPromptSubmit"
+echo "  Claude ~/.claude/settings.json  PostToolUse + UserPromptSubmit -> codex-fleet-status.py, Stop -> codex-fleet-stop.py"
 echo "         -> codex-fleet-status.py"
 echo "See MAINTAINING.md, 'Where the pieces live'."
 exit $rc

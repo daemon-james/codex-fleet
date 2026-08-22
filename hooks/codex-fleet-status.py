@@ -161,32 +161,147 @@ def stall_bucket(seconds):
 UNWATCHED_NAG_SECONDS = 300
 
 
+def observed_pids(verb):
+    """PIDs of `codex-fleet <verb>` processes with a live `claude` ancestor."""
+    observed = []
+    try:
+        out = subprocess.run(
+            ["pgrep", "-f", rf"codex-fleet {verb}"], capture_output=True, text=True
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return observed
+    for line in out.split():
+        try:
+            pid = int(line)
+        except ValueError:
+            continue
+        if has_claude_ancestor(pid) and same_fleet_home(pid):
+            observed.append(pid)
+    return observed
+
+
+def same_fleet_home(pid):
+    """True when `pid` watches the same fleet as this hook.
+
+    A monitor armed for another CODEX_FLEET_HOME (a test harness, a second
+    checkout) must not count as coverage for this one. Compares the process's
+    CODEX_FLEET_HOME, defaulting to ~/.codex-fleet, against ROOT.
+    """
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as fh:
+            env = fh.read().split(b"\0")
+    except OSError:
+        return False
+    theirs = None
+    their_home = None
+    for kv in env:
+        if kv.startswith(b"CODEX_FLEET_HOME="):
+            theirs = kv.split(b"=", 1)[1].decode("utf-8", "replace")
+        elif kv.startswith(b"HOME="):
+            their_home = kv.split(b"=", 1)[1].decode("utf-8", "replace")
+    if theirs is None:
+        theirs = str(Path(their_home or Path.home()) / ".codex-fleet")
+    try:
+        return Path(theirs).resolve() == Path(ROOT).resolve()
+    except OSError:
+        return False
+
+
+def events_monitor_armed():
+    """True when a persistent `codex-fleet events` Monitor is running for this
+    Claude session. That is the inbound half of the fleet connection: every
+    line it prints wakes the orchestrator, idle or not, with nothing to re-arm.
+    """
+    return bool(observed_pids("events"))
+
+
+def observed_wait_pids():
+    """PIDs of `codex-fleet wait` processes that something will actually observe.
+
+    A wait is only useful if its exit wakes the orchestrator. From Claude Code
+    that is true only when it runs as a tracked background Bash task, in which
+    case `claude` sits in its ancestor chain. A wait started with a shell `&`
+    is reparented to PID 1 the moment its shell exits, returns on the first
+    completion, and is observed by nobody. On 2026-08-22 that exact shape
+    dropped the thread three times in one day: three agents sat idle for
+    seventeen minutes each time, with a wait that "existed" according to pgrep.
+    So this walks /proc and counts only waits with a live `claude` ancestor.
+    """
+    return observed_pids("wait")
+
+
+def has_claude_ancestor(pid, limit=32):
+    """True when a `claude` process is somewhere above `pid`."""
+    seen = 0
+    while pid and pid != 1 and seen < limit:
+        seen += 1
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+                stat = fh.read()
+            # comm is in parentheses and may contain spaces; ppid follows it.
+            comm = stat[stat.index("(") + 1 : stat.rindex(")")]
+            ppid = int(stat[stat.rindex(")") + 2 :].split()[1])
+        except (OSError, ValueError, IndexError):
+            return False
+        if comm == "claude":
+            return True
+        pid = ppid
+    return False
+
+
+def observed_wait_names():
+    """Run names named on the command line of every observed wait."""
+    names = set()
+    for pid in observed_wait_pids():
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                argv = fh.read().split(b"\0")
+        except OSError:
+            continue
+        args = [a.decode("utf-8", "replace") for a in argv if a]
+        if "wait" not in args:
+            continue
+        found = wait_run_names(args[args.index("wait") + 1 :])
+        names.update(found if found else {"*"})  # a bare `wait` covers every run
+    return names
+
+
+def wait_run_names(rest):
+    """Run names from a `codex-fleet wait` argv tail, skipping flag values."""
+    names, skip = set(), False
+    for a in rest:
+        if skip:
+            skip = False
+            continue
+        if a in ("--timeout", "-t"):
+            skip = True
+            continue
+        if a.startswith("--timeout="):
+            continue
+        if a.startswith("-"):
+            continue
+        names.add(a)
+    return names
+
+
 def unwatched(running):
-    """Running agents that no live `codex-fleet wait` covers.
+    """Running agents that no OBSERVED `codex-fleet wait` covers.
 
     `wait` returns on the FIRST completion, by design: a fast agent's result
-    must not sit invisible behind a slow one. The cost of that design is that
-    covering a fan-out means re-issuing the wait every time, and the whole
-    workflow then depends on the orchestrator remembering.
-
-    It does not remember. The same thread was dropped on 2026-08-21 and again on
-    2026-08-22, both times the same way: read a result, report it, end the turn,
-    and the rest finish into silence while the owner waits.
-
-    `codex-fleet result` already warns about this, but that is a pull. The
-    orchestrator sees it only when it goes looking, which is the exact habit
-    that fails. This is the same check on the push side, where it cannot be
-    skipped. Throttled, because it is a nag rather than news.
+    must not sit invisible behind a slow one. The cost is that covering a
+    fan-out means re-issuing the wait every time, and the orchestrator does not
+    reliably remember. This check is on the push side so it cannot be skipped,
+    and it counts only waits whose exit will wake someone: see
+    observed_wait_pids for why a bare pgrep was not enough.
     """
     if not running:
         return []
-    try:
-        watched = subprocess.run(
-            ["pgrep", "-af", r"codex-fleet wait"], capture_output=True, text=True
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
+    if events_monitor_armed():
         return []
-    return [n for n in running if n not in watched]
+    covered = observed_wait_names()
+    if "*" in covered:
+        return []
+    return [n for n in running if n not in covered]
 
 
 def main():
@@ -243,9 +358,9 @@ def main():
         if time.time() - last > UNWATCHED_NAG_SECONDS:
             names = " ".join(sorted(loose))
             nag.append(
-                f"{len(loose)} agent(s) running with NOTHING waiting on them: {names}."
-                f" They will finish into silence. Background this now:"
-                f" codex-fleet wait {names}"
+                f"{len(loose)} agent(s) running and nothing will wake you when they finish: {names}."
+                f" Arm the fleet connection once for this session, then forget about it:"
+                f' Monitor({{ command: "codex-fleet events", persistent: true, description: "codex fleet" }})'
             )
             seen["_unwatched_at"] = time.time()
 

@@ -448,6 +448,115 @@ class CodexFleetTests(unittest.TestCase):
         self.assertIsNone(cf.linked_worktree_gitdir(""))
         self.assertIsNone(cf.linked_worktree_gitdir(str(self.temp_path / "absent")))
 
+    def test_coverage_counts_only_observed_processes(self):
+        # A wait or events monitor counts only when a `claude` process is in
+        # its ancestry, because only then does its exit or output wake anyone.
+        # Three dropped threads on 2026-08-22 had a wait that pgrep could see
+        # and nobody could hear.
+        with mock.patch.object(hook, "observed_pids", return_value=[]):
+            self.assertEqual(hook.unwatched(["a", "b"]), ["a", "b"])
+        with mock.patch.object(hook, "events_monitor_armed", return_value=True):
+            self.assertEqual(hook.unwatched(["a", "b"]), [])
+        with mock.patch.object(hook, "events_monitor_armed", return_value=False), mock.patch.object(
+            hook, "observed_wait_names", return_value={"a"}
+        ):
+            self.assertEqual(hook.unwatched(["a", "b"]), ["b"])
+        with mock.patch.object(hook, "events_monitor_armed", return_value=False), mock.patch.object(
+            hook, "observed_wait_names", return_value={"*"}
+        ):
+            self.assertEqual(hook.unwatched(["a", "b"]), [])
+
+    def test_wait_run_names_skips_flag_values(self):
+        self.assertEqual(hook.wait_run_names(["a", "--timeout", "2700", "b"]), {"a", "b"})
+        self.assertEqual(hook.wait_run_names(["--timeout=5", "x"]), {"x"})
+        self.assertEqual(hook.wait_run_names(["--timeout", "5"]), set())
+
+    def test_has_claude_ancestor_walks_proc(self):
+        # A fake /proc: 300 -> 200 (bash) -> 100 (claude) -> 1.
+        stats = {
+            300: "300 (python3) S 200 1 1",
+            200: "200 (bash) S 100 1 1",
+            100: "100 (claude) S 1 1 1",
+        }
+        orphan = {300: "300 (python3) S 1 1 1"}
+        real_open = open
+
+        def fake_open(tree):
+            def _open(path, *a, **k):
+                if str(path).startswith("/proc/"):
+                    pid = int(str(path).split("/")[2])
+                    if pid in tree:
+                        return io.StringIO(tree[pid])
+                    raise OSError("no such pid")
+                return real_open(path, *a, **k)
+            return _open
+
+        with mock.patch("builtins.open", fake_open(stats)):
+            self.assertTrue(hook.has_claude_ancestor(300))
+        with mock.patch("builtins.open", fake_open(orphan)):
+            self.assertFalse(hook.has_claude_ancestor(300))
+
+    def _stop_hook(self, stdin="{}"):
+        return self._run_hook("codex-fleet-stop.py", stdin=stdin)
+
+    def test_stop_hook_blocks_while_an_agent_runs_unobserved(self):
+        run = self.runs / "busy"
+        run.mkdir(parents=True)
+        (run / "meta.json").write_text(
+            json.dumps({"model": "m", "effort": "high", "role": "engineer", "turns": 1,
+                        "pid": os.getpid(), "result_read_turn": 0})
+        )
+        (run / "turn-1.jsonl").write_text("")
+        out = self._stop_hook()
+        self.assertEqual(out.returncode, 0)
+        body = json.loads(out.stdout)
+        self.assertEqual(body["decision"], "block")
+        self.assertIn("busy", body["reason"])
+        self.assertIn("codex-fleet events", body["reason"])
+
+    def test_stop_hook_blocks_on_an_unread_result_and_allows_once_read(self):
+        run = self.runs / "done"
+        run.mkdir(parents=True)
+        (run / "meta.json").write_text(
+            json.dumps({"model": "m", "effort": "high", "role": "engineer", "turns": 2,
+                        "pid": 999999, "result_read_turn": 1})
+        )
+        (run / "turn-2.jsonl").write_text(
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "ok"}}) + "\n"
+            + json.dumps({"type": "turn.completed", "usage": {}}) + "\n"
+        )
+        body = json.loads(self._stop_hook().stdout)
+        self.assertEqual(body["decision"], "block")
+        self.assertIn("done", body["reason"])
+
+        # Reading it through `result` is what marks it read.
+        with mock.patch.object(cf, "alive", return_value=False):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                cf.cmd_result(argparse.Namespace(name="done", all=False))
+        self.assertEqual(cf.load_meta("done")["result_read_turn"], 2)
+        self.assertEqual(self._stop_hook().stdout, "")
+
+    def test_stop_hook_exempts_runs_that_predate_read_tracking(self):
+        # 44 historical runs tripped the first dry run. A run with no field was
+        # read or not before anyone recorded it; blocking on it forever would
+        # make the hook unusable.
+        run = self.runs / "old"
+        run.mkdir(parents=True)
+        (run / "meta.json").write_text(
+            json.dumps({"model": "m", "effort": "high", "role": "engineer", "turns": 3, "pid": 999999})
+        )
+        self.assertEqual(self._stop_hook().stdout, "")
+
+    def test_stop_hook_honours_stop_hook_active(self):
+        run = self.runs / "busy"
+        run.mkdir(parents=True)
+        (run / "meta.json").write_text(
+            json.dumps({"model": "m", "effort": "high", "role": "engineer", "turns": 1,
+                        "pid": os.getpid(), "result_read_turn": 0})
+        )
+        self.assertEqual(self._stop_hook(stdin=json.dumps({"stop_hook_active": True})).stdout, "")
+
     def test_tell_is_what_answers_a_blocking_question(self):
         # `tell` is the only call that actually reaches the agent, so it is the
         # only one that should retire what the agent is waiting on.
@@ -467,20 +576,25 @@ class CodexFleetTests(unittest.TestCase):
         inbox = (self.runs / "stuck" / "inbox.jsonl").read_text(encoding="utf-8")
         self.assertIn("this one", inbox)
 
-    def test_unwatched_names_only_the_agents_no_live_wait_covers(self):
-        # `wait` returns on the FIRST completion by design, so covering a fan-out
-        # means re-issuing it. This is what says so when nobody did.
+    def test_a_pgrep_visible_wait_without_a_claude_ancestor_is_not_coverage(self):
+        # This test used to assert bare-pgrep semantics. That was the bug: a
+        # wait started with a shell & is visible to pgrep and observed by
+        # nobody. Coverage now requires a live `claude` ancestor.
         completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="4242 codex-fleet wait alpha\n"
+            args=[], returncode=0, stdout="4242\n"
         )
-        with mock.patch.object(hook.subprocess, "run", return_value=completed):
-            self.assertEqual(hook.unwatched(["alpha", "beta"]), ["beta"])
-            self.assertEqual(hook.unwatched(["alpha"]), [])
-            self.assertEqual(hook.unwatched([]), [])
-
-        # A pgrep that cannot run must not invent a nag.
+        with mock.patch.object(hook.subprocess, "run", return_value=completed), mock.patch.object(
+            hook, "has_claude_ancestor", return_value=False
+        ):
+            self.assertEqual(hook.observed_pids("wait"), [])
+            self.assertEqual(hook.unwatched(["alpha"]), ["alpha"])
+        with mock.patch.object(hook.subprocess, "run", return_value=completed), mock.patch.object(
+            hook, "has_claude_ancestor", return_value=True
+        ), mock.patch.object(hook, "same_fleet_home", return_value=True):
+            self.assertEqual(hook.observed_pids("wait"), [4242])
+        # A pgrep that cannot run must not invent coverage either way.
         with mock.patch.object(hook.subprocess, "run", side_effect=OSError("no pgrep")):
-            self.assertEqual(hook.unwatched(["alpha"]), [])
+            self.assertEqual(hook.observed_pids("wait"), [])
 
     def test_list_shows_an_agent_that_is_waiting_on_an_answer(self):
         # A blocked agent used to render as "running", indistinguishable from one

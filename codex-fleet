@@ -200,6 +200,56 @@ def last_message(events, name=None):
     return ""
 
 
+# Output tokens per completed reasoning item. Calibrated 2026-08-22 over 52
+# completed turns: the value ran 326 to 600 with a median of 480, and the two
+# models agreed closely (sol 484, terra 478), so one constant covers both.
+# Worst case is 32% low or 25% high.
+#
+# Reasoning items are the estimator because nothing better is available live.
+# Visible text is not: reasoning arrives summarised, so the text-to-token ratio
+# over the same 52 turns spanned 2.3x to 8.8x. Command count is not either, at
+# 2.8x across its middle half against 1.2x for reasoning items.
+#
+# To recalibrate, see MAINTAINING.md, "Recalibrating the in-flight estimate".
+TOKENS_PER_REASONING_ITEM = 480
+
+
+def inflight_output_estimate(events):
+    """Estimated output tokens generated since the last settled turn.
+
+    Codex reports usage only on `turn.completed`, so a running agent reads as
+    zero cost until it lands. That is backwards: a long fan-out looks free at
+    exactly the moment it is spending the most. Count the reasoning items that
+    have arrived since the last completed turn and price them.
+
+    Returns 0 when nothing is in flight, so callers can test it to decide
+    whether to mark the figure as an estimate.
+    """
+    items = 0
+    for ev in events:
+        if ev.get("type") == "turn.completed":
+            # Settled. usage_of has the measured number for everything up to
+            # here, so only items after this point are still unpriced.
+            items = 0
+        elif ev.get("type") == "item.completed" and (ev.get("item") or {}).get(
+            "type"
+        ) == "reasoning":
+            items += 1
+    return items * TOKENS_PER_REASONING_ITEM
+
+
+def render_output_tokens(events, meta=None):
+    """The output-token cell: measured when settled, `~` prefixed when not.
+
+    The tilde is load-bearing. An estimate printed as a bare number is a claim
+    the log cannot support, and the whole point of showing it is to help decide
+    whether to let a fan-out keep running.
+    """
+    settled = usage_of(events, meta)["output_tokens"]
+    pending = inflight_output_estimate(events)
+    return f"~{settled + pending}" if pending else str(settled)
+
+
 def usage_of(events, meta=None):
     total = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
     for ev in events:
@@ -599,7 +649,8 @@ def cmd_list(args):
         role = meta.get("role", "-")
         print(
             f"{name:<24} {paint(f'{st:<9}', colour)} {role:<9} {meta['model']:<15} {meta['effort']:<7} "
-            f"{meta.get('turns', 0):<6} {usage['output_tokens']:<9} {age(latest, meta):<5} {msg}"
+            f"{meta.get('turns', 0):<6} {render_output_tokens(events, meta):<9} "
+            f"{age(latest, meta):<5} {msg}"
         )
 
 
@@ -1093,6 +1144,9 @@ def run_rows():
                 "cwd": meta.get("cwd", ""),
                 "turns": meta.get("turns", 0),
                 "out": usage["output_tokens"],
+                # Estimated tokens for the turn still in flight, 0 when settled.
+                # The dashboard adds it and marks the total with a ~.
+                "out_pending": inflight_output_estimate(events),
                 "age": age(run_dir(name) / f"turn-{meta.get('turns', 1)}.jsonl", meta),
                 "ts": mtime(run_dir(name) / f"turn-{meta.get('turns', 1)}.jsonl", meta),
                 "last": plain(last_message(events, name))[:160],
@@ -1495,7 +1549,7 @@ async function draw(){
   $("facts").innerHTML=cur?[
     fact("Role",cur.role),fact("Model",cur.model,true),fact("Effort",cur.effort),
     fact("Sandbox",cur.sandbox,true),fact("Turns",String(cur.turns)),
-    fact("Output",cur.out.toLocaleString()+" tokens"),fact("Last activity",cur.age+" ago"),
+    fact("Output",(cur.out_pending?"~"+(cur.out+cur.out_pending).toLocaleString():cur.out.toLocaleString())+" tokens"),fact("Last activity",cur.age+" ago"),
     fact("Directory",cur.cwd,true)].join(""):"";
 }
 async function poll(){

@@ -291,6 +291,51 @@ class CodexFleetTests(unittest.TestCase):
         self.assertEqual(cf.usage_of([]), empty)
         self.assertEqual(cf.usage_of([], pruned_meta), expected)
 
+    def test_inflight_estimate_counts_only_reasoning_since_the_last_settled_turn(self):
+        def reasoning():
+            return {"type": "item.completed", "item": {"type": "reasoning", "text": "x"}}
+
+        # Nothing in flight: the run has settled and usage_of holds the truth.
+        settled = [reasoning(), reasoning(), {"type": "turn.completed", "usage": {}}]
+        self.assertEqual(cf.inflight_output_estimate(settled), 0)
+
+        # Two reasoning items arrived after the last completed turn.
+        running = settled + [reasoning(), reasoning()]
+        self.assertEqual(
+            cf.inflight_output_estimate(running), 2 * cf.TOKENS_PER_REASONING_ITEM
+        )
+
+        # Only reasoning is priced. Commands and messages are not generation.
+        noise = running + [
+            {"type": "item.completed", "item": {"type": "command_execution"}},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "hi"}},
+        ]
+        self.assertEqual(
+            cf.inflight_output_estimate(noise), 2 * cf.TOKENS_PER_REASONING_ITEM
+        )
+
+    def test_output_cell_marks_an_estimate_and_never_marks_a_measurement(self):
+        def reasoning():
+            return {"type": "item.completed", "item": {"type": "reasoning", "text": "x"}}
+
+        done = [{"type": "turn.completed", "usage": {"output_tokens": 1000}}]
+        # Settled: a bare number, because the log measured it.
+        self.assertEqual(cf.render_output_tokens(done), "1000")
+
+        # In flight: the tilde says the total is partly inferred. Printing this
+        # as a bare number would be a claim the log cannot support.
+        self.assertEqual(
+            cf.render_output_tokens(done + [reasoning()]),
+            f"~{1000 + cf.TOKENS_PER_REASONING_ITEM}",
+        )
+
+        # A run that has never completed a turn still reports something, which
+        # is the whole point: a long first turn used to read as zero cost.
+        self.assertEqual(
+            cf.render_output_tokens([reasoning(), reasoning()]),
+            f"~{2 * cf.TOKENS_PER_REASONING_ITEM}",
+        )
+
     def test_activity_reads_the_log_before_pruning_and_last_activity_afterward(self):
         run, meta, last_activity = self._make_prunable_run()
         turn = run / "turn-2.jsonl"

@@ -378,7 +378,7 @@ async function draw(){
   $("facts").innerHTML=cur?[
     fact("Role",cur.role),fact("Model",cur.model,true),fact("Effort",cur.effort),
     fact("Sandbox",cur.sandbox,true),fact("Turns",String(cur.turns)),
-    fact("Output",cur.out.toLocaleString()+" tokens"),fact("Last activity",cur.age+" ago"),
+    fact("Output",(cur.out_pending?"~"+(cur.out+cur.out_pending).toLocaleString():cur.out.toLocaleString())+" tokens"),fact("Last activity",cur.age+" ago"),
     fact("Directory",cur.cwd,true)].join(""):"";
 }
 async function poll(){

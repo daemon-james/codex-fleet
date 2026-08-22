@@ -221,3 +221,42 @@ turns it off.
 **Hooks fail open, always.** Both exit 0 with no output on any error. An
 observability hook that can break a tool call is worse than no hook. Keep the
 bare `except` at the bottom of each one.
+
+**The in-flight token figure is an estimate, and the `~` says so.** Codex reports
+usage only on `turn.completed`, so a running agent used to read as zero output
+tokens. That is backwards: a long fan-out looks free at exactly the moment it is
+spending the most. `inflight_output_estimate` prices the reasoning items that
+have arrived since the last completed turn at `TOKENS_PER_REASONING_ITEM`, and
+`render_output_tokens` prefixes the total with `~`. Keep the tilde. A bare number
+would be a claim the event log cannot support, and the figure exists to help
+decide whether to let a fan-out keep running.
+
+### Recalibrating the in-flight estimate
+
+`TOKENS_PER_REASONING_ITEM = 480` was measured on 2026-08-22 across 52 completed
+turns: 326 to 600 per item, median 480, and both models agreed (sol 484, terra
+478). Redo it when the models change:
+
+```bash
+python3 - <<'PY'
+import json, glob, statistics
+rows = []
+for p in glob.glob('/home/dev/.codex-fleet/runs/*/turn-*.jsonl'):
+    items, exact = 0, None
+    for line in open(p, errors='ignore'):
+        try: ev = json.loads(line)
+        except Exception: continue
+        if ev.get('type') == 'turn.completed':
+            exact = (ev.get('usage') or {}).get('output_tokens')
+        elif ev.get('type') == 'item.completed' and (ev.get('item') or {}).get('type') == 'reasoning':
+            items += 1
+    if exact and items:
+        rows.append(exact / items)
+print(f"n={len(rows)} median={statistics.median(rows):.0f} min={min(rows):.0f} max={max(rows):.0f}")
+PY
+```
+
+Two predictors were tried and rejected, so do not reach for them again. Visible
+text is not usable: reasoning arrives summarised, and the text-to-token ratio
+over the same 52 turns spanned 2.3x to 8.8x. Command count is not usable either,
+at 2.8x across its middle half against 1.2x for reasoning items.

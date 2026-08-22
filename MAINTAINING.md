@@ -312,3 +312,19 @@ function that returns a `mnemonik.*` call.
 
 An agent reporting a capability as absent is reporting what it tried, not what
 exists. Probe before believing it.
+
+**A resumed turn has NO MCP tools, and `say` now says so.** Not denied, absent:
+Code Mode reports `TypeError: tools.mcp__metamcp__mnemonik__memory_tools is not
+a function`. `codex exec resume` accepts neither `--approve-for-me` nor `-a`, and
+`approvals_reviewer="auto_review"` with `approval_policy="on-request"` was tested
+on a real resume and does not restore them. The valid `approvals_reviewer`
+values, from the parser error, are `user`, `auto_review` and `guardian_subagent`;
+none brings the tools back. Do not re-try these without testing an actual resume.
+
+`RESUMED_TURN_PREFACE` is prepended to every `say`, telling the agent up front
+that MCP is gone this turn, that it cannot fix it, that Mnemonik is fine on a
+fresh spawn, and to put everything worth keeping in its final message. Two agents
+on 2026-08-22 burned turns discovering this and then reported Mnemonik as down,
+one sleeping in 30-second polls waiting for an answer about it.
+
+Work that genuinely needs Mnemonik belongs on a fresh `spawn`, where MCP works.

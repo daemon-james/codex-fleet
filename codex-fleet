@@ -1053,6 +1053,25 @@ def mark_blocking_answered(name):
     return count
 
 
+def all_questions(name):
+    """Every question this agent has raised, blocking or not, oldest first."""
+    path = run_dir(name) / "outbox.jsonl"
+    if not path.exists():
+        return []
+    out = []
+    try:
+        for ln in path.read_text(encoding="utf-8").splitlines():
+            if not ln.strip():
+                continue
+            try:
+                out.append(json.loads(ln))
+            except ValueError:
+                continue
+    except OSError:
+        return []
+    return out
+
+
 def unanswered_blocking(name):
     """Blocking questions this agent is still waiting on. Read-only."""
     path = run_dir(name) / "outbox.jsonl"
@@ -1170,12 +1189,19 @@ def cmd_events(args):
                     msg = last_message(read_events(latest), name).replace("\n", " ")[:160]
                     print(f"{verb} {name} ({role}): {msg}  ->  codex-fleet result {name}", flush=True)
 
-                for q in unanswered_blocking(name):
+                # Every question, blocking or not. A non-blocking ask is still
+                # a question the agent wants answered; the status hook marks it
+                # read on its first fire, so if this stream only carried
+                # blocking ones the orchestrator never saw it. That happened on
+                # 2026-08-22: an engineer asked whether to change a hook
+                # package, got no answer, and shipped without it.
+                for q in all_questions(name):
                     key = (name, q.get("at"))
                     if key not in asked:
                         asked.add(key)
+                        kind = "ASKING (blocking)" if q.get("blocking") else "asks"
                         print(
-                            f"ASKING {name}: {q.get('text', '').strip()[:300]}  ->  codex-fleet tell {name} \"<answer>\"",
+                            f"{kind} {name}: {q.get('text', '').strip()[:300]}  ->  codex-fleet tell {name} \"<answer>\"",
                             flush=True,
                         )
 

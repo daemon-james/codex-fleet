@@ -641,11 +641,17 @@ def cmd_list(args):
     print(paint(header, "bold"))
     for name, meta in runs:
         st = status_of(name, meta)
+        # An agent waiting on an answer looks identical to one that is thinking.
+        # Say which it is, in the column the eye already goes to.
+        if unanswered_blocking(name):
+            st = "ASKING"
         events = all_events(name, meta)
         usage = usage_of(events, meta)
         latest = run_dir(name) / f"turn-{meta.get('turns', 1)}.jsonl"
         msg = last_message(events, name).replace("\n", " ")[:60]
-        colour = {"running": "green", "failed": "red", "idle": "cyan"}.get(st, "dim")
+        colour = {"running": "green", "failed": "red", "idle": "cyan", "ASKING": "red"}.get(
+            st, "dim"
+        )
         role = meta.get("role", "-")
         print(
             f"{name:<24} {paint(f'{st:<9}', colour)} {role:<9} {meta['model']:<15} {meta['effort']:<7} "
@@ -893,6 +899,12 @@ def cmd_tell(args):
     inbox = d / "inbox.jsonl"
     with open(inbox, "a", encoding="utf-8") as fh:
         fh.write(json.dumps({"text": args.message, "at": now(), "read": False}) + "\n")
+    # Reaching the agent IS the answer, so it retires that agent's outstanding
+    # blocking questions. Nothing else clears them: reading one does not stop
+    # the agent waiting on it.
+    answered = mark_blocking_answered(args.name)
+    if answered:
+        print(f"{args.name}: {answered} blocking question(s) marked answered")
     state = status_of(args.name, meta)
     where = "on its next tool call" if state == "running" else "when it next runs"
     print(f"queued for {args.name} ({state}); delivered {where}")
@@ -930,8 +942,77 @@ def cmd_ask(args):
         print("raised. Keep working; a reply will reach you on a later tool call.")
 
 
-def read_outbox(name, mark_read=True):
-    """Unread agent questions, oldest first. Used by the orchestrator's hook."""
+def mark_blocking_answered(name):
+    """Retire an agent's outstanding blocking questions. Returns how many.
+
+    Called by `tell`, because reaching the agent is the only thing that actually
+    answers it. Reading a question does not.
+    """
+    path = run_dir(name) / "outbox.jsonl"
+    if not path.exists():
+        return 0
+    try:
+        lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    except OSError:
+        return 0
+    rewritten, count = [], 0
+    for ln in lines:
+        try:
+            msg = json.loads(ln)
+        except ValueError:
+            rewritten.append(ln)
+            continue
+        if msg.get("blocking") and not msg.get("answered"):
+            msg["answered"] = True
+            count += 1
+        rewritten.append(json.dumps(msg))
+    if count:
+        try:
+            path.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+        except OSError:
+            return 0
+    return count
+
+
+def unanswered_blocking(name):
+    """Blocking questions this agent is still waiting on. Read-only."""
+    path = run_dir(name) / "outbox.jsonl"
+    if not path.exists():
+        return []
+    out = []
+    try:
+        for ln in path.read_text(encoding="utf-8").splitlines():
+            if not ln.strip():
+                continue
+            try:
+                msg = json.loads(ln)
+            except ValueError:
+                continue
+            if msg.get("blocking") and not msg.get("answered"):
+                out.append(msg)
+    except OSError:
+        return []
+    return out
+
+
+def read_outbox(name, mark_read=True, include_unanswered_blocking=False):
+    """Agent questions, oldest first. Used by `inbox` and the orchestrator's hook.
+
+    A NON-blocking question is delivered once: it is informational and repeating
+    it is noise.
+
+    A BLOCKING question survives being read. The agent has stopped and is waiting,
+    so the only thing that should silence it is an answer. It cost a real
+    incident to learn that: the hook polled the outbox, marked a blocking
+    question read as a side effect of looking, its own output was lost, and
+    `codex-fleet inbox` then printed "nothing raised" while the agent slept in
+    30-second polls for twenty minutes. Reading is not answering, and a surface
+    that reports "nothing" when it means "I already looked once" is worse than
+    one that repeats itself.
+
+    `codex-fleet tell <name>` is what marks them answered, because that is the
+    only call that actually reaches the agent.
+    """
     path = run_dir(name) / "outbox.jsonl"
     if not path.exists():
         return []
@@ -946,9 +1027,10 @@ def read_outbox(name, mark_read=True):
         except ValueError:
             rewritten.append(ln)
             continue
-        if not msg.get("read"):
+        blocking_unanswered = msg.get("blocking") and not msg.get("answered")
+        if not msg.get("read") or (include_unanswered_blocking and blocking_unanswered):
             unread.append(msg)
-            if mark_read:
+            if mark_read and not msg.get("read"):
                 msg["read"] = True
                 changed = True
         rewritten.append(json.dumps(msg))
@@ -963,16 +1045,25 @@ def read_outbox(name, mark_read=True):
 
 
 def cmd_inbox(args):
-    """Show what the agents have asked. Marks them read unless --peek."""
+    """Show what the agents have asked.
+
+    New questions are marked read. Blocking ones keep showing until answered,
+    because an agent that is waiting does not stop waiting when you look at it.
+    """
     names = args.names or [n for n, _ in all_runs()]
     found = False
     for name in names:
-        msgs = read_outbox(name, mark_read=not args.peek)
+        msgs = read_outbox(name, mark_read=not args.peek, include_unanswered_blocking=True)
         for m in msgs:
             found = True
-            flag = paint("BLOCKING", "red") if m.get("blocking") else "asks"
+            if m.get("blocking"):
+                flag = paint("BLOCKING, unanswered", "red")
+            else:
+                flag = "asks"
             print(f"{paint(name, 'bold')} {flag} [{m.get('at','')}]")
             print(f"  {m.get('text','')}")
+            if m.get("blocking"):
+                print(f'  answer it: codex-fleet tell {name} "<answer>"')
     if not found:
         print("nothing raised")
 

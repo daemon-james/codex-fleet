@@ -24,6 +24,17 @@ spec = importlib.util.spec_from_loader(
 cf = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cf)
 
+# The status hook is the PUSH side of the loop and carries its own copy of the
+# outbox rules, so it gets tested rather than trusted.
+hook_spec = importlib.util.spec_from_loader(
+    "codex_fleet_status",
+    importlib.machinery.SourceFileLoader(
+        "codex_fleet_status", str(ROOT / "hooks" / "codex-fleet-status.py")
+    ),
+)
+hook = importlib.util.module_from_spec(hook_spec)
+hook_spec.loader.exec_module(hook)
+
 
 class CodexFleetTests(unittest.TestCase):
     def setUp(self):
@@ -336,6 +347,103 @@ class CodexFleetTests(unittest.TestCase):
             f"~{2 * cf.TOKENS_PER_REASONING_ITEM}",
         )
 
+    def _write_outbox(self, name, messages):
+        run = self.runs / name
+        run.mkdir(parents=True, exist_ok=True)
+        (run / "meta.json").write_text(json.dumps({"model": "m", "effort": "high", "turns": 1}))
+        (run / "outbox.jsonl").write_text(
+            "\n".join(json.dumps(m) for m in messages) + "\n", encoding="utf-8"
+        )
+        return run / "outbox.jsonl"
+
+    def test_a_blocking_question_survives_being_read_and_only_an_answer_clears_it(self):
+        # Reading is not answering. The agent has stopped and is waiting, so a
+        # surface that goes quiet because someone glanced at it is lying.
+        self._write_outbox(
+            "blocked",
+            [
+                {"text": "informational", "at": "t0", "blocking": False, "read": False},
+                {"text": "I am stuck", "at": "t1", "blocking": True, "read": False},
+            ],
+        )
+
+        first = cf.read_outbox("blocked", include_unanswered_blocking=True)
+        self.assertEqual([m["text"] for m in first], ["informational", "I am stuck"])
+
+        # Second look: the informational one is spent, the blocking one is not.
+        second = cf.read_outbox("blocked", include_unanswered_blocking=True)
+        self.assertEqual([m["text"] for m in second], ["I am stuck"])
+
+        self.assertEqual(cf.mark_blocking_answered("blocked"), 1)
+        self.assertEqual(cf.read_outbox("blocked", include_unanswered_blocking=True), [])
+        self.assertEqual(cf.unanswered_blocking("blocked"), [])
+
+    def test_the_hook_repeats_a_blocking_question_on_every_fire(self):
+        # The hook's drain is a separate implementation from read_outbox, and it
+        # is the one that lost a question for twenty minutes.
+        self._write_outbox(
+            "blocked-hook",
+            [
+                {"text": "one-shot", "at": "t0", "blocking": False, "read": False},
+                {"text": "still stuck", "at": "t1", "blocking": True, "read": False},
+            ],
+        )
+        with mock.patch.object(hook, "RUNS", self.runs):
+            first = [m["text"] for m in hook.drain_outbox("blocked-hook")]
+            second = [m["text"] for m in hook.drain_outbox("blocked-hook")]
+            cf.mark_blocking_answered("blocked-hook")
+            third = [m["text"] for m in hook.drain_outbox("blocked-hook")]
+        self.assertEqual(first, ["one-shot", "still stuck"])
+        self.assertEqual(second, ["still stuck"])
+        self.assertEqual(third, [])
+
+    def test_tell_is_what_answers_a_blocking_question(self):
+        # `tell` is the only call that actually reaches the agent, so it is the
+        # only one that should retire what the agent is waiting on.
+        self._write_outbox(
+            "stuck",
+            [{"text": "which one?", "at": "t0", "blocking": True, "read": True}],
+        )
+        self.assertEqual(len(cf.unanswered_blocking("stuck")), 1)
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cf.cmd_tell(argparse.Namespace(name="stuck", message="this one"))
+
+        self.assertEqual(cf.unanswered_blocking("stuck"), [])
+        self.assertIn("1 blocking question(s) marked answered", out.getvalue())
+        # And the answer actually reached the agent's inbox.
+        inbox = (self.runs / "stuck" / "inbox.jsonl").read_text(encoding="utf-8")
+        self.assertIn("this one", inbox)
+
+    def test_unwatched_names_only_the_agents_no_live_wait_covers(self):
+        # `wait` returns on the FIRST completion by design, so covering a fan-out
+        # means re-issuing it. This is what says so when nobody did.
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="4242 codex-fleet wait alpha\n"
+        )
+        with mock.patch.object(hook.subprocess, "run", return_value=completed):
+            self.assertEqual(hook.unwatched(["alpha", "beta"]), ["beta"])
+            self.assertEqual(hook.unwatched(["alpha"]), [])
+            self.assertEqual(hook.unwatched([]), [])
+
+        # A pgrep that cannot run must not invent a nag.
+        with mock.patch.object(hook.subprocess, "run", side_effect=OSError("no pgrep")):
+            self.assertEqual(hook.unwatched(["alpha"]), [])
+
+    def test_list_shows_an_agent_that_is_waiting_on_an_answer(self):
+        # A blocked agent used to render as "running", indistinguishable from one
+        # that is thinking.
+        self._write_outbox(
+            "asker", [{"text": "well?", "at": "t0", "blocking": True, "read": True}]
+        )
+        (self.runs / "asker" / "turn-1.jsonl").write_text("")
+        with mock.patch.object(cf, "alive", return_value=True):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                cf.cmd_list(argparse.Namespace())
+        self.assertIn("ASKING", out.getvalue())
+
     def test_activity_reads_the_log_before_pruning_and_last_activity_afterward(self):
         run, meta, last_activity = self._make_prunable_run()
         turn = run / "turn-2.jsonl"
@@ -460,7 +568,35 @@ class CodexFleetTests(unittest.TestCase):
         self.assertIn("codex-fleet result worker", context)
         self.assertIn("work complete", context)
 
-    def test_status_hook_surfaces_each_outbox_message_once_and_marks_it_read(self):
+    def test_status_hook_surfaces_a_NON_blocking_message_once(self):
+        run, _ = self._make_run(
+            "worker",
+            turns=[[{"type": "turn.completed", "usage": {}}]],
+        )
+        outbox = run / "outbox.jsonl"
+        self._write_jsonl(
+            outbox,
+            [{"text": "for your information", "blocking": False, "read": False}],
+        )
+
+        first = self._run_hook("codex-fleet-status.py")
+        second = self._run_hook("codex-fleet-status.py")
+
+        context = json.loads(first.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("worker asks: for your information", context)
+        stored = json.loads(outbox.read_text(encoding="utf-8"))
+        self.assertTrue(stored["read"])
+        # Spent. Repeating an FYI is noise.
+        self.assertEqual(second.returncode, 0)
+        self.assertEqual(second.stdout, "")
+        self.assertEqual(second.stderr, "")
+
+    def test_status_hook_repeats_a_BLOCKING_message_until_it_is_answered(self):
+        # This test used to assert the opposite, that a blocking question is
+        # delivered once and marked read. That rule lost one on 2026-08-22: the
+        # hook drained it, its output did not reach the orchestrator, and
+        # `codex-fleet inbox` then printed "nothing raised" while the agent slept
+        # in 30-second polls for twenty minutes. Reading is not answering.
         run, _ = self._make_run(
             "worker",
             turns=[[{"type": "turn.completed", "usage": {}}]],
@@ -474,13 +610,15 @@ class CodexFleetTests(unittest.TestCase):
         first = self._run_hook("codex-fleet-status.py")
         second = self._run_hook("codex-fleet-status.py")
 
-        context = json.loads(first.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("worker BLOCKING: need a decision", context)
-        stored = json.loads(outbox.read_text(encoding="utf-8"))
-        self.assertTrue(stored["read"])
-        self.assertEqual(second.returncode, 0)
-        self.assertEqual(second.stdout, "")
-        self.assertEqual(second.stderr, "")
+        for result in (first, second):
+            context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+            self.assertIn("worker BLOCKING: need a decision", context)
+
+        # Answering is what stops it, and only `tell` answers.
+        cf.mark_blocking_answered("worker")
+        third = self._run_hook("codex-fleet-status.py")
+        self.assertEqual(third.returncode, 0)
+        self.assertEqual(third.stdout, "")
 
     def test_status_hook_fails_open_when_fleet_state_cannot_be_read(self):
         self.runs.rmdir()

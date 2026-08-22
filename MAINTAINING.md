@@ -260,3 +260,25 @@ Two predictors were tried and rejected, so do not reach for them again. Visible
 text is not usable: reasoning arrives summarised, and the text-to-token ratio
 over the same 52 turns spanned 2.3x to 8.8x. Command count is not usable either,
 at 2.8x across its middle half against 1.2x for reasoning items.
+
+**Reading a question is not answering it.** An agent that ran `codex-fleet ask
+--blocking` has stopped and is waiting. A NON-blocking question is delivered once,
+because repeating an FYI is noise. A blocking one repeats on every hook fire and
+keeps showing in `inbox` until `codex-fleet tell` answers it, and `list` renders
+that agent as `ASKING` rather than `running`. Only `tell` clears it, because only
+`tell` reaches the agent.
+
+This cost a real incident on 2026-08-22. The hook drained a blocking question and
+marked it read as a side effect of looking, its own output never reached the
+orchestrator, and `codex-fleet inbox` then printed "nothing raised" while the
+agent slept in 30-second polls for twenty minutes and the owner waited on both of
+us. A surface that reports "nothing" when it means "I already looked once" is
+worse than one that repeats itself.
+
+**The unwatched nag is on the push side, and that is the point.** `wait` returns
+on the FIRST completion by design, so covering a fan-out means re-issuing it
+every time. `codex-fleet result` has warned about this since 2026-08-21 and it
+did not help, because a warning you only see when you go looking is invisible to
+the habit that fails: read a result, report it, end the turn. The status hook now
+runs the same check and pushes it, throttled to once per `UNWATCHED_NAG_SECONDS`.
+Keep it on the hook. Moving it back to a command reintroduces the bug.

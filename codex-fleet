@@ -32,7 +32,6 @@ ROLES = {"engineer": "gpt-5.6-sol", "reviewer": "gpt-5.6-terra"}
 MODELS = list(ROLES.values())
 # high for ordinary work, xhigh for complex or high-risk work.
 EFFORTS = ["high", "xhigh"]
-SANDBOXES = ["read-only", "workspace-write", "danger-full-access"]
 
 C = {
     "dim": "\033[2m",
@@ -382,40 +381,29 @@ def describe(ev, verbose=False):
 
 
 def build_cmd(meta, prompt, resume_id=None):
-    """`codex exec resume` accepts neither -s nor -C, so those move into -c overrides.
+    """`codex exec resume` accepts neither -s nor -C, so those move into -c.
 
-    MCP access is why `workspace-write` becomes `--approve-for-me`. Under a plain
-    `-s` sandbox every MCP tool call dies with "MCP tool call requires approval,
-    but approval policy is never": the tools are listed and the network is fine,
-    but nothing can approve the call in a non-interactive run. An agent that
-    cannot reach Mnemonik cannot search project memory, cannot checkpoint, and
-    cannot close the task it just finished. Three did exactly that on 2026-08-21.
+    There is one mode: `-C` confines the working directory, and nothing else is
+    narrowed. A worktree passed as `-C` is the isolation. Anything beyond that
+    was trapping a frontier model on the user's own machine, whose config.toml
+    already says `danger-full-access`.
 
-    `--approve-for-me` routes those approvals through automatic review and is
-    genuinely confined: verified 2026-08-21 that a write into a sibling repo
-    fails with "Read-only file system" while writes under `-C` succeed. It
-    refuses to combine with `-s`, hence the branch.
+    What the old `workspace-write` default actually cost, all on 2026-08-22:
+    `git add` could not write the shared object database from a worktree, so no
+    agent in one could commit; `net.listen` could not bind, so agents reported
+    sandbox refusals as test failures; and every MCP call died with "MCP tool
+    call requires approval, but approval policy is never", so no agent could
+    reach Mnemonik. Three lost turns to it and the orchestrator lost an
+    afternoon diagnosing walls it had built itself.
 
-    read-only keeps no MCP, and under it the agent cannot write anywhere, so
-    `codex-fleet ask` cannot reach the outbox either. That is a real cost: on
-    2026-08-21 a reviewer found two criticals and could neither checkpoint them
-    nor raise them mid-turn. Prefer `-s workspace-write --worktree` for review
-    work. The throwaway worktree is the isolation, and `-C` confines writes to
-    it, so the reviewer still cannot touch what it reviews.
+    Old runs may carry another `sandbox` value in meta.json. It is ignored.
     """
     cmd = ["codex", "exec"]
     if resume_id:
         cmd += ["resume", resume_id]
     cmd += ["--json", "-m", meta["model"], "-c", f"model_reasoning_effort={meta['effort']}"]
-    if resume_id and meta["sandbox"] != "danger-full-access":
-        # Only narrow a resumed turn when the run deliberately asked to be
-        # narrowed. Stamping the sandbox unconditionally overrode the user's own
-        # config.toml, which is what created the traps: no writes to the shared
-        # git object database, no socket binds, and every MCP call refused with
-        # "requires approval, but approval policy is never". These are frontier
-        # models on the user's own machine and the user's config already says
-        # danger-full-access.
-        cmd += ["-c", f'sandbox_mode="{meta["sandbox"]}"']
+    if resume_id:
+        cmd += ["-c", 'sandbox_mode="danger-full-access"']
         # KNOWN LIMITATION, do not "fix" this without testing a real resume.
         # resume rejects --approve-for-me, so a resumed agent falls back to the
         # user's approval_policy ("never") and every MCP call dies with "MCP
@@ -428,16 +416,8 @@ def build_cmd(meta, prompt, resume_id=None):
         # reverted rather than shipped broken.
         # Until the right key is found: tell a resumed agent to put findings in
         # its final message, and checkpoint on its behalf.
-    elif meta["sandbox"] == "danger-full-access":
-        # The default, and the same thing the user's config.toml already sets.
-        # `-C` still confines the working directory, which is what makes a
-        # worktree an isolated place to work; it is the sandbox that used to
-        # block git, sockets and MCP approvals on top of that.
-        cmd += ["-s", meta["sandbox"], "-C", meta["cwd"]]
-    elif meta["sandbox"] == "workspace-write":
-        cmd += ["--approve-for-me", "-C", meta["cwd"]]
     else:
-        cmd += ["-s", meta["sandbox"], "-C", meta["cwd"]]
+        cmd += ["-s", "danger-full-access", "-C", meta["cwd"]]
     # The run directory is the agent's only way to speak back mid-turn. Without
     # it, an agent that hits a blocker must burn the rest of its turn and tell
     # you at the end, when the answer is worth nothing.
@@ -636,7 +616,7 @@ def cmd_spawn(args):
         "role": args.role,
         "model": ROLES[args.role],
         "effort": args.effort,
-        "sandbox": args.sandbox,
+        "sandbox": "danger-full-access",
         "cwd": work_cwd,
         "run_dir": str(d.resolve()),
         "worktree": worktree,
@@ -1827,7 +1807,6 @@ def main():
         "--effort", "-e", default="high", choices=EFFORTS,
         help="high for ordinary work, xhigh for complex or high-risk work",
     )
-    sp.add_argument("--sandbox", "-s", default="danger-full-access", choices=SANDBOXES)
     sp.add_argument("--cd", "-C", default=".")
     sp.add_argument(
         "--worktree", "-w", action="store_true",

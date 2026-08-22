@@ -88,20 +88,25 @@ runs sort by START time, fixed for the life of the run. Everything else sorts by
 last activity, fixed once the process exits. If you change ordering, sample it
 repeatedly with agents live and prove it does not move.
 
-**`read-only` costs an agent its memory and its voice.** Under `-s read-only`
-Codex disables MCP approval, so `session_bootstrap` and `checkpoint` both fail,
-and the agent cannot write anywhere, so `codex-fleet ask` fails too. A reviewer
-once produced two criticals and could record neither. For review work use
-`-s workspace-write --worktree`: the throwaway worktree is the isolation and
-`-C` confines writes to it. Probed and confirmed: writes to the real repo and to
-`$HOME` both return `Read-only file system`, while MCP and `ask` work.
+**There is one sandbox mode, and `-C` is the whole of it.** `spawn` takes no
+`-s`. Every agent runs `danger-full-access` confined to `-C`, which is what this
+machine's own `config.toml` already sets. A worktree passed as `-C` is the
+isolation, including for a reviewer that must not edit what it reviews.
 
-**`workspace-write` needs `--approve-for-me`, not `-s`.** Under a plain `-s
-workspace-write` every MCP tool call dies with "MCP tool call requires approval,
-but approval policy is never". The tools are listed, the network is fine, and
-nothing can approve the call in a non-interactive run. `--approve-for-me`
-routes approvals through automatic review and refuses to combine with `-s`,
-which is why `build_cmd` branches.
+Everything narrower was tried and every bit of it cost something. `read-only`
+disabled MCP approval, so `session_bootstrap` and `checkpoint` failed and the
+agent could not even write its own outbox, meaning `codex-fleet ask` failed too:
+one reviewer found two criticals and could record neither. `workspace-write`
+looked safer and was worse, because it silently overrode the user's config: on
+2026-08-22 it stopped `git add` writing the shared object database from a
+worktree so no agent could commit, blocked `net.listen` so agents reported
+sandbox refusals as test failures, and refused every MCP call with "requires
+approval, but approval policy is never". Three agents lost turns and the
+orchestrator lost an afternoon diagnosing walls it had built.
+
+These are frontier models on the user's own hardware. Confining the working
+directory is reasonable. Anything past that is trapping them, and the trap costs
+more than it ever prevented.
 
 **Codex's own risk layer blocks sending file contents to an MCP server.** It
 rejected `mnemonik.file_context({filePaths})` with "This action was rejected due

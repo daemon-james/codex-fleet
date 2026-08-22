@@ -10,7 +10,7 @@ product and its code must never be committed there.
 
 ```bash
 ./install.sh          # symlink the CLI and both hooks into place
-codex-fleet spawn "Trace how X works. Report file:line." -n scout -r engineer -e high -s read-only -C /path/to/repo
+codex-fleet spawn "Trace how X works. Report file:line." -n scout -r engineer -e high -C /path/to/repo
 codex-fleet list      # every run, most recent first
 codex-fleet tell scout "actually, start from the handler"   # reaches it mid-turn
 codex-fleet result scout

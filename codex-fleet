@@ -1197,8 +1197,16 @@ def cmd_events(args):
                 # package, got no answer, and shipped without it.
                 for q in all_questions(name):
                     key = (name, q.get("at"))
-                    if key not in asked:
-                        asked.add(key)
+                    if key in asked:
+                        continue
+                    asked.add(key)
+                    # On the first pass a fresh monitor has no memory of what
+                    # was already shown. Questions from finished runs, and
+                    # answered ones, are history, not events; replaying them
+                    # on every restart buried the live ones.
+                    if first and (st != "running" or q.get("answered")):
+                        continue
+                    if True:
                         kind = "ASKING (blocking)" if q.get("blocking") else "asks"
                         print(
                             f"{kind} {name}: {q.get('text', '').strip()[:300]}  ->  codex-fleet tell {name} \"<answer>\"",

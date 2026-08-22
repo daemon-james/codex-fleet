@@ -397,6 +397,57 @@ class CodexFleetTests(unittest.TestCase):
         self.assertEqual(second, ["still stuck"])
         self.assertEqual(third, [])
 
+    def test_a_linked_worktree_gets_its_git_dir_made_writable(self):
+        # A linked worktree keeps its metadata under the MAIN repo, outside -C.
+        # The sandbox grants write to -C only, so without this the agent can edit
+        # files it can never commit, and the error it sees is a read-only
+        # filesystem on a path it never chose. Two agents lost turns to this.
+        main_git = self.temp_path / "repo" / ".git" / "worktrees" / "feature"
+        main_git.mkdir(parents=True)
+        wt = self.temp_path / "wt"
+        wt.mkdir()
+        (wt / ".git").write_text(f"gitdir: {main_git}\n", encoding="utf-8")
+
+        self.assertEqual(cf.linked_worktree_gitdir(str(wt)), str(main_git))
+
+        meta = {
+            "sandbox": "workspace-write",
+            "cwd": str(wt),
+            "model": "m",
+            "effort": "high",
+            "run_dir": str(self.runs / "w"),
+        }
+        fresh = cf.build_cmd(meta, "go")
+        self.assertIn("--add-dir", fresh)
+        self.assertIn(str(main_git), fresh)
+
+        resumed = cf.build_cmd(meta, "go", resume_id="thread-1")
+        roots = [a for a in resumed if a.startswith("sandbox_workspace_write.writable_roots=")]
+        self.assertEqual(len(roots), 1)
+        self.assertIn(str(main_git), roots[0])
+
+    def test_an_ordinary_checkout_grants_no_extra_git_root(self):
+        # `.git` is a directory already inside -C. Nothing to add, and adding a
+        # guess would widen the sandbox for no reason.
+        repo = self.temp_path / "plain"
+        (repo / ".git").mkdir(parents=True)
+        self.assertIsNone(cf.linked_worktree_gitdir(str(repo)))
+
+        # A .git file pointing nowhere real is also not a root.
+        broken = self.temp_path / "broken"
+        broken.mkdir()
+        (broken / ".git").write_text("gitdir: /nope/does/not/exist\n", encoding="utf-8")
+        self.assertIsNone(cf.linked_worktree_gitdir(str(broken)))
+
+        # Neither is a .git file that is not a gitdir pointer at all.
+        odd = self.temp_path / "odd"
+        odd.mkdir()
+        (odd / ".git").write_text("not a pointer\n", encoding="utf-8")
+        self.assertIsNone(cf.linked_worktree_gitdir(str(odd)))
+
+        self.assertIsNone(cf.linked_worktree_gitdir(""))
+        self.assertIsNone(cf.linked_worktree_gitdir(str(self.temp_path / "absent")))
+
     def test_tell_is_what_answers_a_blocking_question(self):
         # `tell` is the only call that actually reaches the agent, so it is the
         # only one that should retire what the agent is waiting on.

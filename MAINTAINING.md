@@ -282,3 +282,16 @@ did not help, because a warning you only see when you go looking is invisible to
 the habit that fails: read a result, report it, end the turn. The status hook now
 runs the same check and pushes it, throttled to once per `UNWATCHED_NAG_SECONDS`.
 Keep it on the hook. Moving it back to a command reintroduces the bug.
+
+**A worktree agent needs the main repo's git dir, or it cannot commit.** A
+linked worktree's `.git` is a FILE holding `gitdir: <path>`, and that path lives
+under the MAIN repo, outside the `-C` the sandbox grants. Without
+`linked_worktree_gitdir` in the writable roots, `git add` cannot create
+`index.lock` and the agent hits a read-only filesystem on a path it never chose
+and cannot diagnose. Three agents lost turns to this on 2026-08-22, each burning
+a blocking question and a hand-commit by the orchestrator. It applies to both the
+`--add-dir` path on a fresh spawn and the `writable_roots` config on a resume,
+because `codex exec resume` accepts neither `-C` nor `--add-dir`.
+
+An ordinary checkout returns `None` here: its `.git` is a directory already
+inside `-C`, and widening the sandbox on a guess would be worse than the bug.

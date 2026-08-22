@@ -433,13 +433,18 @@ def build_cmd(meta, prompt, resume_id=None):
     # so the resume path sets the same thing through config. Getting this wrong
     # is silent until someone calls `say`, and then the whole turn dies with
     # "unexpected argument '--add-dir' found".
-    run_path = meta.get("run_dir")
-    if run_path:
+    #
+    # The git dir joins it for the same reason: a linked worktree keeps its
+    # metadata under the main repo, outside -C, so without this the agent can
+    # edit files it can never commit.
+    extra_roots = [p for p in (meta.get("run_dir"), linked_worktree_gitdir(meta.get("cwd"))) if p]
+    if extra_roots:
         if resume_id:
-            roots = json.dumps([run_path, meta["cwd"]])
+            roots = json.dumps([*extra_roots, meta["cwd"]])
             cmd += ["-c", f"sandbox_workspace_write.writable_roots={roots}"]
         else:
-            cmd += ["--add-dir", run_path]
+            for root in extra_roots:
+                cmd += ["--add-dir", root]
     cmd += ["--skip-git-repo-check"]
     for extra in meta.get("config", []):
         cmd += ["-c", extra]
@@ -447,6 +452,43 @@ def build_cmd(meta, prompt, resume_id=None):
         cmd += ["--output-schema", meta["output_schema"]]
     cmd.append(prompt)
     return cmd
+
+
+def linked_worktree_gitdir(cwd):
+    """The real git directory when `cwd` is a linked worktree, else None.
+
+    A linked worktree's `.git` is a FILE holding `gitdir: <path>`, and that path
+    lives under the MAIN repo, outside `-C`. The sandbox grants write to `-C`
+    only, so `git add` cannot create index.lock and the agent cannot commit its
+    own work. It has no way to diagnose that either: the error is a read-only
+    filesystem on a path it never chose.
+
+    This blocked two agents on 2026-08-22, each burning a blocking question and a
+    hand-commit by the orchestrator. Granting the git dir is what makes
+    `spawn --worktree` and `-C <a worktree>` actually usable.
+
+    Returns None for an ordinary checkout, where `.git` is a directory already
+    inside `-C`, and for anything unreadable. Never raises: a wrong guess here
+    must not stop a spawn.
+    """
+    if not cwd:
+        return None
+    try:
+        marker = os.path.join(cwd, ".git")
+        if not os.path.isfile(marker):
+            return None
+        with open(marker, encoding="utf-8") as fh:
+            head = fh.read(4096).strip()
+    except OSError:
+        return None
+    if not head.startswith("gitdir:"):
+        return None
+    gitdir = head.split("gitdir:", 1)[1].strip()
+    if not gitdir:
+        return None
+    if not os.path.isabs(gitdir):
+        gitdir = os.path.normpath(os.path.join(cwd, gitdir))
+    return gitdir if os.path.isdir(gitdir) else None
 
 
 def launch(name, meta, prompt, resume_id=None):

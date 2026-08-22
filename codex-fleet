@@ -407,7 +407,14 @@ def build_cmd(meta, prompt, resume_id=None):
     if resume_id:
         cmd += ["resume", resume_id]
     cmd += ["--json", "-m", meta["model"], "-c", f"model_reasoning_effort={meta['effort']}"]
-    if resume_id:
+    if resume_id and meta["sandbox"] != "danger-full-access":
+        # Only narrow a resumed turn when the run deliberately asked to be
+        # narrowed. Stamping the sandbox unconditionally overrode the user's own
+        # config.toml, which is what created the traps: no writes to the shared
+        # git object database, no socket binds, and every MCP call refused with
+        # "requires approval, but approval policy is never". These are frontier
+        # models on the user's own machine and the user's config already says
+        # danger-full-access.
         cmd += ["-c", f'sandbox_mode="{meta["sandbox"]}"']
         # KNOWN LIMITATION, do not "fix" this without testing a real resume.
         # resume rejects --approve-for-me, so a resumed agent falls back to the
@@ -421,6 +428,12 @@ def build_cmd(meta, prompt, resume_id=None):
         # reverted rather than shipped broken.
         # Until the right key is found: tell a resumed agent to put findings in
         # its final message, and checkpoint on its behalf.
+    elif meta["sandbox"] == "danger-full-access":
+        # The default, and the same thing the user's config.toml already sets.
+        # `-C` still confines the working directory, which is what makes a
+        # worktree an isolated place to work; it is the sandbox that used to
+        # block git, sockets and MCP approvals on top of that.
+        cmd += ["-s", meta["sandbox"], "-C", meta["cwd"]]
     elif meta["sandbox"] == "workspace-write":
         cmd += ["--approve-for-me", "-C", meta["cwd"]]
     else:
@@ -858,35 +871,6 @@ def refresh_worktree(meta):
     return None if before == after else f"advanced {before} to {after}"
 
 
-# Prepended to every resumed prompt.
-#
-# A resumed turn has NO MCP tools. Not denied, absent: Code Mode reports
-# `TypeError: tools.mcp__metamcp__mnemonik__memory_tools is not a function`,
-# and `codex exec resume` accepts neither `--approve-for-me` nor `-a`.
-# `approvals_reviewer="auto_review"` with `approval_policy="on-request"` was
-# tested on a real resume and does not restore them either. Do not re-try those
-# without testing an actual resume.
-#
-# Agents that do not know this waste the turn discovering it, then report
-# Mnemonik as down. Two did exactly that on 2026-08-22, one sleeping in
-# 30-second polls waiting for an answer to a question about it. Telling them up
-# front costs a few tokens and removes the trap.
-RESUMED_TURN_PREFACE = """[Resumed turn. Read this first.]
-
-You have NO MCP tools this turn, including Mnemonik. This is a limitation of
-`codex exec resume`, not a fault in your work and not something you can fix.
-Do not try to call them, do not investigate it, and do not report Mnemonik as
-unavailable: it works fine on a fresh spawn.
-
-So: put everything worth keeping in your FINAL MESSAGE. Decisions, root causes,
-what you concluded was NOT a defect and why. The orchestrator checkpoints it for
-you. Your file edits and commits work normally.
-
----
-
-"""
-
-
 def cmd_say(args):
     meta = load_meta(args.name)
     if alive(meta.get("pid")):
@@ -898,9 +882,7 @@ def cmd_say(args):
     note = refresh_worktree(meta)
     if note:
         print(f"  worktree {note}")
-    _, events_path = launch(
-        args.name, meta, RESUMED_TURN_PREFACE + args.prompt, resume_id=meta["thread_id"]
-    )
+    _, events_path = launch(args.name, meta, args.prompt, resume_id=meta["thread_id"])
     print(f"{args.name}: turn {meta['turns']} started (pid {meta['pid']})")
     if args.follow:
         cmd_watch(argparse.Namespace(name=args.name, verbose=args.verbose, raw=False, since=0))
@@ -1845,7 +1827,7 @@ def main():
         "--effort", "-e", default="high", choices=EFFORTS,
         help="high for ordinary work, xhigh for complex or high-risk work",
     )
-    sp.add_argument("--sandbox", "-s", default="workspace-write", choices=SANDBOXES)
+    sp.add_argument("--sandbox", "-s", default="danger-full-access", choices=SANDBOXES)
     sp.add_argument("--cd", "-C", default=".")
     sp.add_argument(
         "--worktree", "-w", action="store_true",

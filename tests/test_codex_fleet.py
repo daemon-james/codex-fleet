@@ -448,49 +448,6 @@ class CodexFleetTests(unittest.TestCase):
         self.assertIsNone(cf.linked_worktree_gitdir(""))
         self.assertIsNone(cf.linked_worktree_gitdir(str(self.temp_path / "absent")))
 
-    def test_a_resumed_prompt_is_told_it_has_no_mcp(self):
-        # A resumed turn has no MCP tools at all. Agents that do not know waste
-        # the turn discovering it and then report Mnemonik as down.
-        run = self.runs / "resumer"
-        run.mkdir(parents=True)
-        (run / "meta.json").write_text(
-            json.dumps(
-                {
-                    "model": "m",
-                    "effort": "high",
-                    "sandbox": "workspace-write",
-                    "cwd": str(self.temp_path),
-                    "thread_id": "thread-9",
-                    "turns": 1,
-                    "pid": 999999,
-                }
-            )
-        )
-        captured = {}
-
-        def fake_launch(name, meta, prompt, resume_id=None):
-            captured["prompt"] = prompt
-            captured["resume_id"] = resume_id
-            return (1234, run / "turn-2.jsonl")
-
-        with mock.patch.object(cf, "launch", fake_launch), mock.patch.object(
-            cf, "alive", return_value=False
-        ):
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                cf.cmd_say(
-                    argparse.Namespace(
-                        name="resumer", prompt="carry on", effort=None, force=True, follow=False
-                    )
-                )
-
-        self.assertEqual(captured["resume_id"], "thread-9")
-        self.assertTrue(captured["prompt"].startswith("[Resumed turn."))
-        self.assertIn("NO MCP tools", captured["prompt"])
-        self.assertIn("FINAL MESSAGE", captured["prompt"])
-        # The caller's own words survive intact after the preface.
-        self.assertTrue(captured["prompt"].endswith("carry on"))
-
     def test_tell_is_what_answers_a_blocking_question(self):
         # `tell` is the only call that actually reaches the agent, so it is the
         # only one that should retire what the agent is waiting on.

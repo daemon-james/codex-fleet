@@ -146,20 +146,34 @@ The status hook is only a safety net here: it fires on a tool call or a turn
 boundary, so it cannot reach an orchestrator that has ended its turn and is
 waiting on nothing else.
 
-**A resumed agent loses its Mnemonik.** `codex exec resume` rejects
-`--approve-for-me`, so it falls back to the user's `approval_policy` (`never`)
-and every MCP call dies with "MCP tool call requires approval, but approval
-policy is never". Proven by running one agent twice: it answered "Succeeded."
-on its spawn turn and hit that error on the resume turn.
+**Do not sandbox the agents tighter than the user's own config.** This machine's
+`~/.codex/config.toml` sets `sandbox_mode = "danger-full-access"` and
+`approval_policy = "never"`, and the models are frontier coders on the user's own
+hardware. `codex-fleet` used to force `workspace-write` on every spawn and stamp
+`-c sandbox_mode` over the user config on every resume. That single override
+caused every wall hit on 2026-08-22: `git add` could not write the shared object
+database in a worktree, `node net.listen` could not bind, and EVERY MCP call
+failed with `MCP tool call requires approval, but approval policy is never`.
 
-`approval_policy="granular"` is NOT the fix. It parses on spawn but resume
-rejects it with "invalid type: unit variant, expected newtype variant", meaning
-it wants a value rather than a bare string. That was tried and reverted rather
-than shipped broken; do not re-try it without testing an actual resume.
+Three agents lost turns to it and the orchestrator lost an afternoon, twice
+concluding the cause was something else. The default is now `danger-full-access`,
+and a resume only narrows the sandbox when that run explicitly asked to be
+narrowed. `-C` still confines the working directory, which is what makes a
+worktree an isolated place to work; the sandbox on top of it bought nothing.
 
-Until the right key is found, tell a resumed agent to put findings in its final
-message and checkpoint on its behalf. The turn still works, it just cannot
-remember anything itself.
+`read-only` and `workspace-write` remain, for when narrowing is a deliberate
+choice, such as a reviewer that must not be able to edit what it reviews. Know
+what each costs before choosing it: under `read-only` an agent cannot write to
+its own run directory, so `codex-fleet ask` cannot reach you either.
+
+**Read the event log, not the agent's prose, when a capability looks broken.**
+The failures above were plain in `turn-*.jsonl` the whole time: ten resumed turns
+each carrying `mcp_tool_call ... status: failed ... "requires approval, but
+approval policy is never"`. The orchestrator instead believed an agent that
+reported `TypeError: ... is not a function`, which was Code Mode failing on a
+script the agent wrote rather than an MCP call it made, and spent hours on the
+wrong diagnosis. An agent reporting a capability as absent is reporting what it
+tried.
 
 **A worktree is branched at spawn and never moves on its own.** Resume a
 reviewer three commits later and it reads the files it was born with while being
@@ -312,19 +326,3 @@ function that returns a `mnemonik.*` call.
 
 An agent reporting a capability as absent is reporting what it tried, not what
 exists. Probe before believing it.
-
-**A resumed turn has NO MCP tools, and `say` now says so.** Not denied, absent:
-Code Mode reports `TypeError: tools.mcp__metamcp__mnemonik__memory_tools is not
-a function`. `codex exec resume` accepts neither `--approve-for-me` nor `-a`, and
-`approvals_reviewer="auto_review"` with `approval_policy="on-request"` was tested
-on a real resume and does not restore them. The valid `approvals_reviewer`
-values, from the parser error, are `user`, `auto_review` and `guardian_subagent`;
-none brings the tools back. Do not re-try these without testing an actual resume.
-
-`RESUMED_TURN_PREFACE` is prepended to every `say`, telling the agent up front
-that MCP is gone this turn, that it cannot fix it, that Mnemonik is fine on a
-fresh spawn, and to put everything worth keeping in its final message. Two agents
-on 2026-08-22 burned turns discovering this and then reported Mnemonik as down,
-one sleeping in 30-second polls waiting for an answer about it.
-
-Work that genuinely needs Mnemonik belongs on a fresh `spawn`, where MCP works.

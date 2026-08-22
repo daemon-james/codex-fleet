@@ -295,3 +295,20 @@ because `codex exec resume` accepts neither `-C` nor `--add-dir`.
 
 An ordinary checkout returns `None` here: its `.git` is a directory already
 inside `-C`, and widening the sandbox on a guess would be worse than the bug.
+
+**Give agents the real Mnemonik call shape, not Code Mode syntax.** Writing
+`mnemonik.checkpoint({...})` in a brief is wrong. That syntax only works INSIDE
+the tool, so an agent runs it as raw JavaScript and gets
+`TypeError: Cannot read properties of undefined`. Two agents on 2026-08-22 then
+reported that Mnemonik was unreachable and that the connector needed approval,
+and the orchestrator spent a chunk of the afternoon chasing a block that did not
+exist. Probes from both a worktree and the main repo showed
+`mnemonik__memory_discover`, `mnemonik__memory_tools` and
+`mnemonik__session_bootstrap` all visible and the call succeeding.
+
+The real call is the MCP tool on server `metamcp`, named
+`mnemonik__memory_tools`, with one `code` argument holding an async arrow
+function that returns a `mnemonik.*` call.
+
+An agent reporting a capability as absent is reporting what it tried, not what
+exists. Probe before believing it.

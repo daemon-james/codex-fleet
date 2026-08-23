@@ -593,6 +593,34 @@ def remove_worktree(meta):
     return r.returncode == 0
 
 
+def current_owner():
+    """The identity of the session driving this process, if there is one.
+
+    Claude Code exports CLAUDE_CODE_SESSION_ID into every Bash call, so runs
+    spawned by an orchestrator carry its session id. CODEX_FLEET_OWNER
+    overrides it for scripts. A plain human shell has neither, and its runs
+    are unowned.
+    """
+    return os.environ.get("CODEX_FLEET_OWNER") or os.environ.get("CLAUDE_CODE_SESSION_ID")
+
+
+def owned_here(meta, owner=None):
+    """Whether this run belongs to the current session's view of the fleet.
+
+    Two orchestrator sessions ran fleets simultaneously on 2026-08-23 and each
+    one's hooks nagged about the other's runs; reading a foreign result then
+    suppressed the owner's own unread reminder. Ownership filters exist so
+    that cannot recur. An unowned run (spawned before this field, or from a
+    human shell) stays visible to everyone, and a viewer with no identity (a
+    human shell) sees everything.
+    """
+    run_owner = meta.get("owner")
+    if not run_owner:
+        return True
+    owner = owner if owner is not None else current_owner()
+    return owner is None or run_owner == owner
+
+
 def cmd_spawn(args):
     if not shutil.which("codex"):
         die("codex CLI not found on PATH")
@@ -617,6 +645,7 @@ def cmd_spawn(args):
         "model": ROLES[args.role],
         "effort": args.effort,
         "sandbox": "danger-full-access",
+        "owner": current_owner(),
         # 0 means "no turn read yet". The Stop hook blocks ending the turn while
         # turns > result_read_turn on an idle run. Runs that predate this field
         # are exempt; see the hook.
@@ -692,10 +721,11 @@ def cmd_list(args):
             st, "dim"
         )
         role = meta.get("role", "-")
+        foreign = "" if owned_here(meta) else paint("  [other session]", "dim")
         print(
             f"{name:<24} {paint(f'{st:<9}', colour)} {role:<9} {meta['model']:<15} {meta['effort']:<7} "
             f"{meta.get('turns', 0):<6} {render_output_tokens(events, meta):<9} "
-            f"{age(latest, meta):<5} {msg}"
+            f"{age(latest, meta):<5} {msg}{foreign}"
         )
 
 
@@ -1173,6 +1203,8 @@ def cmd_events(args):
     while True:
         try:
             for name, meta in all_runs():
+                if not getattr(args, "all", False) and not owned_here(meta):
+                    continue
                 st = status_of(name, meta)
                 prev = seen.get(name)
                 latest = run_dir(name) / f"turn-{meta.get('turns', 1)}.jsonl"
@@ -2025,6 +2057,7 @@ def main():
     akp.set_defaults(func=cmd_ask)
 
     ev = sub.add_parser("events", help="one line per fleet event, forever; arm once as a persistent Monitor")
+    ev.add_argument("--all", action="store_true", help="include runs owned by other sessions")
     ev.set_defaults(func=cmd_events)
     ibp = sub.add_parser("inbox", help="show questions agents have raised")
     ibp.add_argument("names", nargs="*")

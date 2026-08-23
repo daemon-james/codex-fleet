@@ -37,3 +37,16 @@ idle agents.
 
 **Changing it** is covered by `MAINTAINING.md` in this repo. Read that first.
 It carries the traps, and every one of them cost something to find.
+
+## Session ownership
+
+Two orchestrator sessions can run fleets on one machine without talking over
+each other. `spawn` stamps the spawning session's identity
+(`CLAUDE_CODE_SESSION_ID`, or `CODEX_FLEET_OWNER` to override) into the run's
+`meta.json`. The status hook, the stop hook, and `codex-fleet events` then
+speak only about the invoking session's runs; `codex-fleet events --all`
+restores the machine-wide view. Runs with no owner (spawned from a plain
+shell, or predating this field) stay visible to every session, and a viewer
+with no identity sees everything, so single-orchestrator behavior is
+unchanged. `list` always shows every run and tags foreign ones with
+`[other session]`.

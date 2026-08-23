@@ -81,7 +81,14 @@ def last_message(turn_path):
     return ""
 
 
-def survey():
+def foreign(meta, owner):
+    """A run another session owns. Unowned runs belong to everyone, and a
+    viewer with no identity (a human shell) sees everything."""
+    run_owner = meta.get("owner")
+    return bool(run_owner) and bool(owner) and run_owner != owner
+
+
+def survey(owner=None):
     out = {}
     if not RUNS.exists():
         return out
@@ -92,6 +99,8 @@ def survey():
         try:
             meta = json.loads(meta_path.read_text())
         except (json.JSONDecodeError, OSError):
+            continue
+        if foreign(meta, owner):
             continue
         turn_path = d / f"turn-{meta.get('turns', 1)}.jsonl"
         quiet = int(time.time() - turn_path.stat().st_mtime) if turn_path.exists() else 0
@@ -305,7 +314,15 @@ def unwatched(running):
 
 
 def main():
-    runs = survey()
+    # Two orchestrator sessions can run fleets at once; this hook must speak
+    # only about the invoking session's runs. Claude passes session_id on
+    # stdin for every hook event.
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except (json.JSONDecodeError, OSError):
+        payload = {}
+    owner = payload.get("session_id") or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    runs = survey(owner=owner)
     if not runs:
         return
 

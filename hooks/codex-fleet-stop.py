@@ -56,6 +56,7 @@ def main():
     status = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(status)
 
+    owner = payload.get("session_id") or os.environ.get("CLAUDE_CODE_SESSION_ID")
     running, unread = [], []
     if RUNS.is_dir():
         for d in sorted(RUNS.iterdir()):
@@ -65,6 +66,11 @@ def main():
             try:
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
+                continue
+            if status.foreign(meta, owner):
+                # Another session's run. Blocking this session's stop over it
+                # forces the wrong orchestrator to consume the result, which
+                # silently clears the owner's own unread reminder.
                 continue
             name = d.name
             if alive(meta.get("pid")):

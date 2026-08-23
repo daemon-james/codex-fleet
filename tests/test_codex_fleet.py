@@ -169,6 +169,10 @@ class CodexFleetTests(unittest.TestCase):
         env["CODEX_FLEET_HOME"] = str(self.fleet_home)
         env.pop("CODEX_FLEET_RUN", None)
         env.pop("CLAUDE_HOOK_EVENT_NAME", None)
+        # Ownership identity must come only from the stdin payload a test
+        # chooses to send, not from whichever session runs the suite.
+        env.pop("CLAUDE_CODE_SESSION_ID", None)
+        env.pop("CODEX_FLEET_OWNER", None)
         if run_name is not None:
             env["CODEX_FLEET_RUN"] = run_name
         return env
@@ -947,3 +951,79 @@ class CodexFleetTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OwnershipTests(CodexFleetTests):
+    """Two orchestrator sessions ran fleets at once on 2026-08-23 and each
+    one's hooks nagged about the other's runs. Ownership scopes the noise."""
+
+    def _unread_meta(self, owner=None):
+        meta = {"model": "m", "effort": "high", "role": "engineer", "turns": 2,
+                "pid": 999999, "result_read_turn": 1}
+        if owner is not None:
+            meta["owner"] = owner
+        return meta
+
+    def _unread_run(self, name, owner=None):
+        run = self.runs / name
+        run.mkdir(parents=True)
+        (run / "meta.json").write_text(json.dumps(self._unread_meta(owner)))
+        (run / "turn-2.jsonl").write_text(
+            json.dumps({"type": "item.completed",
+                        "item": {"type": "agent_message", "text": "ok"}}) + "\n"
+        )
+
+    def test_owned_here_matrix(self):
+        self.assertTrue(cf.owned_here({}, owner="sess-a"))
+        self.assertTrue(cf.owned_here({"owner": "sess-a"}, owner="sess-a"))
+        self.assertFalse(cf.owned_here({"owner": "sess-b"}, owner="sess-a"))
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+            os.environ.pop("CODEX_FLEET_OWNER", None)
+            self.assertTrue(cf.owned_here({"owner": "sess-b"}))
+
+    def test_current_owner_prefers_the_explicit_override(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "sess-env",
+                                          "CODEX_FLEET_OWNER": "sess-override"}):
+            self.assertEqual(cf.current_owner(), "sess-override")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "sess-env"}, clear=False):
+            os.environ.pop("CODEX_FLEET_OWNER", None)
+            self.assertEqual(cf.current_owner(), "sess-env")
+
+    def test_stop_hook_ignores_other_sessions_unread_results(self):
+        self._unread_run("mine", owner="sess-a")
+        self._unread_run("theirs", owner="sess-b")
+        out = self._run_hook("codex-fleet-stop.py",
+                             stdin=json.dumps({"session_id": "sess-a"}))
+        body = json.loads(out.stdout)
+        self.assertEqual(body["decision"], "block")
+        self.assertIn("mine", body["reason"])
+        self.assertNotIn("theirs", body["reason"])
+
+    def test_stop_hook_still_blocks_on_legacy_unowned_runs(self):
+        self._unread_run("legacy")
+        body = json.loads(self._run_hook(
+            "codex-fleet-stop.py",
+            stdin=json.dumps({"session_id": "sess-a"})).stdout)
+        self.assertEqual(body["decision"], "block")
+        self.assertIn("legacy", body["reason"])
+
+    def test_stop_hook_with_no_identity_sees_every_run(self):
+        self._unread_run("mine", owner="sess-a")
+        self._unread_run("theirs", owner="sess-b")
+        body = json.loads(self._run_hook("codex-fleet-stop.py", stdin="{}").stdout)
+        self.assertEqual(body["decision"], "block")
+        self.assertIn("mine", body["reason"])
+        self.assertIn("theirs", body["reason"])
+
+    def test_status_survey_filters_foreign_runs(self):
+        self._unread_run("mine", owner="sess-a")
+        self._unread_run("theirs", owner="sess-b")
+        self._unread_run("legacy")
+        old_runs = hook.RUNS
+        hook.RUNS = self.runs
+        try:
+            self.assertEqual(sorted(hook.survey(owner="sess-a")), ["legacy", "mine"])
+            self.assertEqual(sorted(hook.survey()), ["legacy", "mine", "theirs"])
+        finally:
+            hook.RUNS = old_runs

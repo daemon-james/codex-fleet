@@ -38,6 +38,45 @@ idle agents.
 **Changing it** is covered by `MAINTAINING.md` in this repo. Read that first.
 It carries the traps, and every one of them cost something to find.
 
+## Housekeeping
+
+Run state expires on a schedule so the directory cannot grow without limit.
+`codex-fleet gc` does three things and prints what it did:
+
+| stage | default | what it touches |
+| --- | --- | --- |
+| collapse | after 2 days | a finished run loses its event log and keeps its result, token count and thread id, so `say` still resumes it |
+| delete | after 14 days | a collapsed run is removed entirely |
+| sweep | every run | a worktree is removed only when it has no uncommitted changes and its branch adds nothing to the default branch |
+
+The sweep tests for a squash merge as well as an ordinary one, because this
+repository squash-merges and a squashed branch is never an ancestor of `main`
+even though every line of it shipped. A worktree it will not remove is named
+with the reason, because a worktree deleted by mistake is lost work.
+
+It runs at the end of every `spawn`, and from cron at 06:30 daily for the
+weeks nobody spawns anything. Pruning used to run only on spawn, which meant a
+fleet that went quiet kept everything forever.
+
+`--dry-run` changes nothing. `--delete-days 0` never deletes. Override the
+defaults with `CODEX_FLEET_PRUNE_DAYS` and `CODEX_FLEET_DELETE_DAYS`.
+
+## One stream per session
+
+`codex-fleet events` takes a lock named after the session that owns it. A
+second monitor for the same session refuses to start and names the process
+already streaming, rather than delivering every notification twice with two
+separate memories of what it already reported. A lock left by a killed monitor
+is taken over, so a crash cannot disable notifications until someone finds a
+file they do not know exists.
+
+A running monitor also checks whether the script it loaded has changed, and
+exits when it has. Python reads the whole file once at startup, so without
+this a monitor keeps running the version it started with no matter how many
+times the tool is rewritten. One ran for two days on code that had been
+replaced 21 minutes after it started, which is why it still had no session
+filter and reported every run on the machine into every session.
+
 ## Session ownership
 
 Two orchestrator sessions can run fleets on one machine without talking over

@@ -1027,3 +1027,303 @@ class OwnershipTests(CodexFleetTests):
             self.assertEqual(sorted(hook.survey()), ["legacy", "mine", "theirs"])
         finally:
             hook.RUNS = old_runs
+
+
+class FleetTempHome(unittest.TestCase):
+    """Temp fleet home only. Deliberately holds no tests of its own: a test
+    class that inherits from one that has tests re-runs every one of them."""
+
+    def setUp(self):
+        self._old_root = cf.ROOT
+        self._old_runs = cf.RUNS
+        self._temp = tempfile.TemporaryDirectory()
+        self.temp_path = Path(self._temp.name)
+        self.fleet_home = self.temp_path / "fleet-home"
+        self.runs = self.fleet_home / "runs"
+        self.runs.mkdir(parents=True)
+        cf.ROOT = self.fleet_home
+        cf.RUNS = self.runs
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        cf.ROOT = self._old_root
+        cf.RUNS = self._old_runs
+        self._temp.cleanup()
+
+
+class GcRetentionTests(FleetTempHome):
+    """Retention has to delete things, so every guard gets a test that would
+    fail if the guard were removed."""
+
+    def _collapsed_run(self, name, *, pruned_days_ago, **meta_updates):
+        run = self.runs / name
+        run.mkdir()
+        (run / "result.txt").write_text("the conclusion", encoding="utf-8")
+        when = datetime.fromtimestamp(
+            time.time() - pruned_days_ago * 86400, tz=timezone.utc
+        ).isoformat()
+        meta = {
+            "name": name,
+            "role": "engineer",
+            "turns": 1,
+            "thread_id": "t-1",
+            "pruned_at": when,
+            "final_status": "idle",
+            "last_activity": time.time() - pruned_days_ago * 86400,
+        }
+        meta.update(meta_updates)
+        (run / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        return run
+
+    def _gc(self, *, prune_days=2, delete_days=14, dry_run=False, quiet=False):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cf.cmd_gc(argparse.Namespace(
+                prune_days=prune_days, delete_days=delete_days,
+                dry_run=dry_run, quiet=quiet,
+            ))
+        return buf.getvalue()
+
+    def test_a_collapsed_run_past_the_limit_is_deleted(self):
+        run = self._collapsed_run("ancient", pruned_days_ago=20)
+        self._gc(delete_days=14)
+        self.assertFalse(run.exists())
+
+    def test_a_collapsed_run_inside_the_limit_survives(self):
+        run = self._collapsed_run("recent", pruned_days_ago=3)
+        self._gc(delete_days=14)
+        self.assertTrue(run.exists())
+        self.assertTrue((run / "result.txt").exists())
+
+    def test_a_run_that_was_never_collapsed_is_never_deleted(self):
+        run = self._collapsed_run("uncollapsed", pruned_days_ago=99)
+        meta = json.loads((run / "meta.json").read_text())
+        del meta["pruned_at"]
+        (run / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        self._gc(delete_days=1)
+        self.assertTrue(run.exists())
+
+    def test_a_running_agent_is_never_deleted_however_old_its_record(self):
+        run = self._collapsed_run("busy", pruned_days_ago=99, pid=os.getpid())
+        self._gc(delete_days=1)
+        self.assertTrue(run.exists())
+
+    def test_delete_days_zero_deletes_nothing(self):
+        run = self._collapsed_run("ancient", pruned_days_ago=999)
+        self._gc(delete_days=0)
+        self.assertTrue(run.exists())
+
+    def test_dry_run_deletes_nothing_and_says_what_it_would_do(self):
+        run = self._collapsed_run("ancient", pruned_days_ago=20)
+        out = self._gc(delete_days=14, dry_run=True)
+        self.assertTrue(run.exists())
+        self.assertIn("would delete", out)
+        self.assertIn("ancient", out)
+
+    def test_quiet_says_nothing_when_there_was_nothing_to_do(self):
+        self.assertEqual(self._gc(quiet=True).strip(), "")
+
+
+class WorktreeSweepTests(FleetTempHome):
+    """A worktree is deleted work if the sweep gets it wrong, so the merged
+    check is tested against a squash merge, which is what this repo actually
+    does and what an ancestry test alone would miss."""
+
+    def _git(self, *args, cwd):
+        return subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            capture_output=True, text=True, check=False,
+            env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                 "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"},
+        )
+
+    def _repo(self):
+        root = self.temp_path / "repo"
+        root.mkdir()
+        self._git("init", "-q", "-b", "main", cwd=root)
+        (root / "a.txt").write_text("one\n")
+        self._git("add", "-A", cwd=root)
+        self._git("commit", "-qm", "first", cwd=root)
+        return root
+
+    def _run_with_worktree(self, name, root, branch, *, pid=None):
+        wt = self.temp_path / f"wt-{name}"
+        self._git("worktree", "add", "-q", "-b", branch, str(wt), "main", cwd=root)
+        run = self.runs / name
+        run.mkdir()
+        (run / "meta.json").write_text(json.dumps({
+            "name": name, "role": "engineer", "turns": 1, "pid": pid,
+            "worktree": str(wt), "worktree_root": str(root), "worktree_branch": branch,
+            "pruned_at": None,
+        }), encoding="utf-8")
+        return wt
+
+    def test_a_squash_merged_branch_is_recognised_as_landed_and_swept(self):
+        root = self._repo()
+        wt = self._run_with_worktree("squashed", root, "fleet/squashed")
+        (wt / "b.txt").write_text("work\n")
+        self._git("add", "-A", cwd=wt)
+        self._git("commit", "-qm", "the work", cwd=wt)
+        # Squash merge: the content lands on main under a different commit, so
+        # the branch is NOT an ancestor of main.
+        self._git("merge", "--squash", "fleet/squashed", cwd=root)
+        self._git("commit", "-qm", "squashed in", cwd=root)
+        self.assertNotEqual(
+            0,
+            self._git("merge-base", "--is-ancestor", "fleet/squashed", "main", cwd=root).returncode,
+            "fixture is wrong: a squash merge must not be an ancestor",
+        )
+
+        removed, refused = cf.sweep_worktrees()
+
+        self.assertEqual([n for n, _ in removed], ["squashed"])
+        self.assertEqual(refused, [])
+        self.assertFalse(wt.exists())
+
+    def test_an_ordinary_merge_is_also_swept(self):
+        root = self._repo()
+        wt = self._run_with_worktree("merged", root, "fleet/merged")
+        (wt / "b.txt").write_text("work\n")
+        self._git("add", "-A", cwd=wt)
+        self._git("commit", "-qm", "the work", cwd=wt)
+        self._git("merge", "--no-ff", "-q", "-m", "merge", "fleet/merged", cwd=root)
+
+        removed, refused = cf.sweep_worktrees()
+
+        self.assertEqual([n for n, _ in removed], ["merged"])
+        self.assertFalse(wt.exists())
+
+    def test_a_branch_holding_unmerged_work_is_refused_and_kept(self):
+        root = self._repo()
+        wt = self._run_with_worktree("unmerged", root, "fleet/unmerged")
+        (wt / "b.txt").write_text("work nobody merged\n")
+        self._git("add", "-A", cwd=wt)
+        self._git("commit", "-qm", "the work", cwd=wt)
+
+        removed, refused = cf.sweep_worktrees()
+
+        self.assertEqual(removed, [])
+        self.assertEqual([n for n, _ in refused], ["unmerged"])
+        self.assertIn("not in main", refused[0][1])
+        self.assertTrue(wt.exists())
+
+    def test_uncommitted_changes_are_refused_and_kept(self):
+        root = self._repo()
+        wt = self._run_with_worktree("dirty", root, "fleet/dirty")
+        (wt / "scratch.txt").write_text("half a thought\n")
+
+        removed, refused = cf.sweep_worktrees()
+
+        self.assertEqual(removed, [])
+        self.assertEqual(refused, [("dirty", "uncommitted changes")])
+        self.assertTrue(wt.exists())
+
+    def test_a_running_agents_worktree_is_never_swept(self):
+        root = self._repo()
+        wt = self._run_with_worktree("busy", root, "fleet/busy", pid=os.getpid())
+
+        removed, refused = cf.sweep_worktrees()
+
+        self.assertEqual(removed, [])
+        self.assertEqual(refused, [("busy", "agent still running")])
+        self.assertTrue(wt.exists())
+
+    def test_a_dangling_worktree_reference_is_cleared_not_reported(self):
+        run = self.runs / "gone"
+        run.mkdir()
+        (run / "meta.json").write_text(json.dumps({
+            "name": "gone", "turns": 1, "pid": None,
+            "worktree": str(self.temp_path / "not-here"),
+            "worktree_root": str(self.temp_path / "repo"),
+            "worktree_branch": "fleet/gone",
+        }), encoding="utf-8")
+
+        removed, refused = cf.sweep_worktrees()
+
+        self.assertEqual((removed, refused), ([], []))
+        self.assertNotIn("worktree", json.loads((run / "meta.json").read_text()))
+
+    def test_dry_run_sweeps_nothing(self):
+        root = self._repo()
+        wt = self._run_with_worktree("squashed", root, "fleet/squashed")
+        self._git("merge", "--squash", "fleet/squashed", cwd=root)
+
+        removed, refused = cf.sweep_worktrees(dry_run=True)
+
+        self.assertEqual([n for n, _ in removed], ["squashed"])
+        self.assertTrue(wt.exists())
+
+
+class EventsMonitorTests(FleetTempHome):
+    """The two failures that let a monitor run for two days on deleted code
+    while a second one duplicated every notification."""
+
+    def _events(self, owner="session-a"):
+        """Run the stream with a tripwire on its sleep.
+
+        The monitor loops forever by design, so a test that only relies on the
+        exit condition working will HANG rather than fail when that condition
+        breaks. Reaching the sleep means the loop did not exit, so make that an
+        immediate failure with a readable message.
+        """
+        buf = io.StringIO()
+        tripwire = AssertionError("the monitor entered its poll loop instead of exiting")
+        with mock.patch.object(cf, "current_owner", return_value=owner):
+            with mock.patch.object(cf.time, "sleep", side_effect=tripwire):
+                with contextlib.redirect_stdout(buf):
+                    with contextlib.suppress(AssertionError):
+                        cf.cmd_events(argparse.Namespace(all=False))
+        return buf.getvalue()
+
+    def test_a_second_monitor_for_the_same_session_refuses_to_start(self):
+        cf.ROOT.mkdir(parents=True, exist_ok=True)
+        # A real other process, because the holder check has to tell
+        # "someone else is streaming" apart from "this is my own lock".
+        other = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(other.wait)
+        self.addCleanup(other.kill)
+        cf.events_lock_path("session-a").write_text(str(other.pid))
+
+        # side_effect, not return_value: if the refusal ever stops working,
+        # this test fails fast instead of streaming forever.
+        with mock.patch.object(cf, "script_fingerprint", side_effect=[(1, 1), (2, 2)]):
+            out = self._events(owner="session-a")
+
+        self.assertIn("already streaming", out)
+        self.assertIn(str(other.pid), out)
+        self.assertEqual(
+            cf.events_lock_path("session-a").read_text().strip(), str(other.pid),
+            "the refused monitor must not steal the live holder's lock",
+        )
+
+    def test_a_lock_left_by_a_dead_monitor_is_taken_over(self):
+        cf.ROOT.mkdir(parents=True, exist_ok=True)
+        # A pid that cannot be alive.
+        cf.events_lock_path("session-a").write_text("999999999")
+
+        self.assertIsNone(cf.claim_events_lock("session-a"))
+        self.assertEqual(
+            cf.events_lock_path("session-a").read_text().strip(), str(os.getpid())
+        )
+
+    def test_two_different_sessions_each_get_their_own_stream(self):
+        cf.ROOT.mkdir(parents=True, exist_ok=True)
+        cf.events_lock_path("session-a").write_text(str(os.getpid()))
+
+        self.assertIsNone(cf.claim_events_lock("session-b"))
+        self.assertNotEqual(
+            cf.events_lock_path("session-a"), cf.events_lock_path("session-b")
+        )
+
+    def test_the_monitor_exits_when_the_script_it_loaded_has_changed(self):
+        with mock.patch.object(cf, "script_fingerprint", side_effect=[(1, 1), (2, 2)]):
+            out = self._events()
+
+        self.assertIn("codex-fleet was updated", out)
+
+    def test_the_monitor_releases_its_lock_when_it_exits(self):
+        with mock.patch.object(cf, "script_fingerprint", side_effect=[(1, 1), (2, 2)]):
+            self._events(owner="session-a")
+
+        self.assertFalse(cf.events_lock_path("session-a").exists())
+

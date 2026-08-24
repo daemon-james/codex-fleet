@@ -1324,9 +1324,86 @@ class WorktreeSweepTests(FleetTempHome):
                 prune_days=2, delete_days=14, dry_run=False, quiet=False))
         out = buf.getvalue()
 
-        self.assertIn("noisy also took 2 ignored file(s)", out)
+        self.assertIn("noisy also took 2 ignored path(s)", out)
         self.assertIn("build", out)
         self.assertIn("logs", out)
+        self.assertIn("kept in", out)
+        self.assertIn("ignored-files.tar.gz", out)
+
+    def test_the_whole_env_family_is_protected_not_two_literal_names(self):
+        """A review named .env.development.local: just as unrecoverable as
+        .env, and it was being treated as disposable. One the agent CREATED
+        has no copy to compare against, so it refuses."""
+        root = self._repo()
+        (root / ".gitignore").write_text(".env*\n")
+        self._git("add", ".gitignore", cwd=root)
+        self._git("commit", "-qm", "ignore env family", cwd=root)
+        wt = self._run_with_worktree("family", root, "fleet/family")
+        (wt / ".env.development.local").write_text("agent wrote this\n")
+
+        removed, refused = cf.sweep_worktrees()
+
+        self.assertEqual(removed, [])
+        self.assertIn(".env.development.local", refused[0][1])
+        self.assertTrue((wt / ".env.development.local").exists())
+
+    def test_an_edited_env_local_is_refused_like_env(self):
+        root = self._repo()
+        (root / ".gitignore").write_text(".env*\n")
+        self._git("add", ".gitignore", cwd=root)
+        self._git("commit", "-qm", "ignore env family", cwd=root)
+        (root / ".env.local").write_text("original\n")
+        wt = self._run_with_worktree("locally", root, "fleet/locally")
+        (wt / ".env.local").write_text("edited by the agent\n")
+
+        removed, refused = cf.sweep_worktrees()
+
+        self.assertEqual(removed, [])
+        self.assertIn(".env.local", refused[0][1])
+
+    def test_ignored_files_are_archived_before_the_worktree_goes(self):
+        """A printed line is a report, not a record. Small ignored files are
+        copied into the run directory so a removal can be undone."""
+        root = self._repo()
+        (root / ".gitignore").write_text("notes/\n")
+        self._git("add", ".gitignore", cwd=root)
+        self._git("commit", "-qm", "ignore notes", cwd=root)
+        wt = self._run_with_worktree("noted", root, "fleet/noted")
+        (wt / "notes").mkdir()
+        (wt / "notes" / "thinking.md").write_text("the agent's reasoning\n")
+
+        removed, refused = cf.sweep_worktrees()
+
+        self.assertEqual([e[0] for e in removed], ["noted"], refused)
+        self.assertFalse(wt.exists())
+        archive = self.runs / "noted" / "ignored-files.tar.gz"
+        self.assertTrue(archive.exists(), "the ignored file was not kept anywhere")
+        import tarfile
+        with tarfile.open(archive) as tar:
+            self.assertEqual(tar.getnames(), ["notes/thinking.md"])
+            self.assertEqual(
+                tar.extractfile("notes/thinking.md").read(),
+                b"the agent's reasoning\n",
+            )
+
+    def test_a_file_too_large_to_archive_is_named_as_gone_for_good(self):
+        """The budget exists so build output does not get copied. Whatever it
+        excludes has to be said out loud."""
+        root = self._repo()
+        (root / ".gitignore").write_text("build/\n")
+        self._git("add", ".gitignore", cwd=root)
+        self._git("commit", "-qm", "ignore build", cwd=root)
+        wt = self._run_with_worktree("heavy", root, "fleet/heavy")
+        (wt / "build").mkdir()
+        (wt / "build" / "big.bundle").write_bytes(b"x" * (cf.GC_ARCHIVE_MAX_FILE_BYTES + 1))
+        (wt / "build" / "small.json").write_text("{}")
+
+        removed, refused = cf.sweep_worktrees()
+
+        self.assertEqual([e[0] for e in removed], ["heavy"], refused)
+        archived, skipped = removed[0][3], removed[0][4]
+        self.assertEqual(archived, 1)
+        self.assertEqual(skipped, ["build/big.bundle"])
 
     def test_the_node_modules_symlink_does_not_block_the_sweep(self):
         """spawn links node_modules into every worktree and git ignores it.
@@ -1393,6 +1470,123 @@ class WorktreeSweepTests(FleetTempHome):
 
         self.assertEqual([e[0] for e in removed], ["squashed"])
         self.assertTrue(wt.exists())
+
+
+class SpawnWorktreeTests(FleetTempHome):
+    """The sweep protects the files spawn copies in. These tests create those
+    files by hand, so this one checks spawn actually creates them: without it
+    the protection could be guarding something that no longer happens."""
+
+    def _git(self, *args, cwd):
+        return subprocess.run(
+            ["git", "-C", str(cwd), *args], capture_output=True, text=True,
+            env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                 "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"},
+        )
+
+    def test_spawn_copies_the_env_files_and_links_node_modules(self):
+        root = self.temp_path / "repo"
+        root.mkdir()
+        self._git("init", "-q", "-b", "main", cwd=root)
+        (root / "a.txt").write_text("x")
+        self._git("add", "-A", cwd=root)
+        self._git("commit", "-qm", "first", cwd=root)
+        (root / ".env").write_text("SECRET=1\n")
+        (root / ".env.local").write_text("LOCAL=1\n")
+        (root / "node_modules").mkdir()
+        (root / "node_modules" / "dep.js").write_text("//")
+
+        with mock.patch.object(cf, "ROOT", self.fleet_home):
+            wt, branch, resolved_root = cf.make_worktree("wtest", str(root))
+        wt = Path(wt)
+        self.addCleanup(lambda: self._git("worktree", "remove", "--force", str(wt), cwd=root))
+
+        self.assertEqual((wt / ".env").read_text(), "SECRET=1\n")
+        self.assertEqual((wt / ".env.local").read_text(), "LOCAL=1\n")
+        self.assertTrue((wt / "node_modules").is_symlink())
+        self.assertEqual(resolved_root, str(root))
+        for name in (".env", ".env.local", "node_modules"):
+            self.assertTrue(
+                cf.is_spawn_placed(name),
+                f"spawn creates {name} but the sweep does not protect it",
+            )
+
+
+class CronInstallTests(unittest.TestCase):
+    """install.sh writes to the user's crontab, so its failure modes are
+    somebody's lost scheduled jobs. A stub crontab stands in for the real one."""
+
+    STUB = '#!/usr/bin/env bash\nmode=$(cat MODEFILE)\nif [[ "$1" == "-l" ]]; then\n  if [[ "$mode" == "broken" ]]; then echo "some other listing"; exit 2; fi\n  [[ -f TABLEFILE ]] || exit 1\n  cat TABLEFILE\n  exit 0\nfi\ncat > TABLEFILE\n'
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        base = Path(self._temp.name)
+        self.home = base / "home"; self.home.mkdir()
+        self.bin = base / "bin"; self.bin.mkdir()
+        self.table = base / "crontab.txt"
+        self.mode = base / "mode"; self.mode.write_text("normal")
+        stub = self.bin / "crontab"
+        stub.write_text(
+            self.STUB.replace("MODEFILE", str(self.mode)).replace("TABLEFILE", str(self.table))
+        )
+        stub.chmod(0o755)
+
+    def _install(self, *args):
+        return subprocess.run(
+            ["bash", str(ROOT / "install.sh"), *args],
+            capture_output=True, text=True,
+            env={**os.environ, "HOME": str(self.home),
+                 "PATH": f"{self.bin}:{os.environ['PATH']}"},
+        )
+
+    def test_a_fresh_install_adds_the_job_and_creates_its_log_directory(self):
+        """cron sets up the output redirection BEFORE running the command, so
+        a missing directory means the job fails without ever starting gc."""
+        result = self._install()
+
+        self.assertIn("added    daily gc cron", result.stdout)
+        self.assertIn("codex-fleet gc", self.table.read_text())
+        self.assertTrue((self.home / ".codex-fleet").is_dir(),
+                        "the directory the cron line redirects into is missing")
+
+    def test_existing_crontab_entries_survive(self):
+        self.table.write_text("MAILTO=me\n0 3 * * * /usr/bin/payroll\n")
+
+        self._install()
+
+        text = self.table.read_text()
+        self.assertIn("MAILTO=me", text)
+        self.assertIn("/usr/bin/payroll", text)
+        self.assertIn("codex-fleet gc", text)
+
+    def test_running_it_twice_does_not_add_the_job_twice(self):
+        self._install()
+        first = self.table.read_text()
+
+        second = self._install()
+
+        self.assertIn("ok       daily gc cron", second.stdout)
+        self.assertEqual(self.table.read_text(), first)
+
+    def test_a_failed_crontab_read_changes_nothing(self):
+        """`crontab -l` exits non-zero both when there is no crontab and when
+        the read genuinely failed. Piping a failed read into `crontab -` would
+        install a crontab holding only our line and discard the rest."""
+        self.table.write_text("0 3 * * * /usr/bin/payroll\n")
+        self.mode.write_text("broken")
+
+        result = self._install()
+
+        self.assertIn("SKIPPED  daily gc cron", result.stdout)
+        self.assertEqual(self.table.read_text(), "0 3 * * * /usr/bin/payroll\n")
+
+    def test_a_commented_out_entry_is_not_a_scheduled_job(self):
+        self.table.write_text("#30 6 * * * codex-fleet gc --quiet\n")
+
+        result = self._install("--check")
+
+        self.assertIn("MISSING  daily gc cron", result.stdout)
 
 
 class EventsMonitorTests(FleetTempHome):
@@ -1622,6 +1816,29 @@ class EventsMonitorTests(FleetTempHome):
 
         self.assertIn("already streaming", out)
         self.assertIn("another process", out)
+
+    def test_a_long_session_name_does_not_make_the_first_monitor_refuse(self):
+        """Abstract socket names are capped at 107 bytes. Spelling the owner
+        into the name made an 89-character one fail to bind, and the caller
+        read that failure as 'somebody else holds it', so the FIRST monitor
+        refused itself and no notifications arrived at all."""
+        cf.ROOT.mkdir(parents=True, exist_ok=True)
+        for length in (36, 89, 400):
+            owner = "x" * length
+            self.assertIsNone(
+                cf.claim_events_lock(owner),
+                f"a {length}-character session name refused its own monitor",
+            )
+            cf.release_events_lock(owner)
+
+    def test_the_lock_name_separates_users_and_installations(self):
+        """Two installations sharing the 'anon' name would silence one of
+        them."""
+        first = cf.events_lock_name(None)
+        with mock.patch.object(cf, "ROOT", self.temp_path / "another-home"):
+            second = cf.events_lock_name(None)
+        self.assertNotEqual(first, second)
+        self.assertLess(len(first), 108)
 
     def test_the_monitor_frees_the_lock_when_it_exits(self):
         """A monitor that exits must leave the stream claimable, or re-arming

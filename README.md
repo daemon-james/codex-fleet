@@ -55,19 +55,23 @@ an ordinary one, because this repository squash-merges and a squashed branch
 is never an ancestor of `main` even though every line of it shipped.
 
 Ignored files need their own rule, because `git status` does not mention them
-and `git worktree remove --force` deletes them anyway. Two kinds, treated
-differently:
+and `git worktree remove --force` deletes them anyway. Two kinds:
 
-- **The files spawn copied in**, `.env` and `.env.local`, refuse the removal
-  when they have been edited. They came from outside the worktree, so an edit
-  cannot be regenerated and losing it would be silent.
-- **Everything else the project ignores** is destroyed and named in the
-  output. A .gitignore is the project's own statement that those files are
-  reproducible, and a worktree holds hundreds of them after a build. Refusing
-  on all of them would mean no worktree is ever removed, which is the pile-up
-  this exists to prevent.
+- **`node_modules` and anything named `.env*`** refuse the removal when they
+  have been edited, or when the agent created one that has no counterpart to
+  compare against. These cannot be regenerated, and `.env.development.local`
+  is exactly as unrecoverable as `.env`.
+- **Everything else the project ignores** is copied into the run directory as
+  `ignored-files.tar.gz` and then removed with the worktree. A .gitignore says
+  a file is untracked, not that it can be rebuilt, so a printed line is not a
+  good enough record. Files over 1 MB, and anything past a 5 MB total, are not
+  copied and are named individually as gone for good; that is the limit that
+  keeps build output from being archived, and a built worktree here holds 414
+  ignored paths.
 
-Anything not removed is named with the reason. It runs at the end of every
+Anything not removed is named with the reason. Refusing on every ignored file
+instead would mean no worktree is ever removed, which is the pile-up this
+exists to prevent. It runs at the end of every
 `spawn`, and `install.sh` adds a 06:30 cron entry for the weeks nobody spawns
 anything. Pruning used to run only on spawn, so a fleet that went quiet kept
 everything forever.
@@ -91,6 +95,16 @@ defeated by deleting the file, because the holder locks an inode and the next
 monitor simply creates a new file and locks that instead. The pid file beside
 it is a breadcrumb for the refusal message. Deleting it costs a helpful
 message, not correctness.
+
+The name is a digest of the user id, the fleet home and the session, not the
+session spelled out. Abstract names are capped at 107 bytes, and an 89
+character session id made the bind fail, which the caller read as "somebody
+else holds it", so the first monitor refused itself and no notifications
+arrived at all. Hashing also stops two users, or two installations, colliding
+on the shared `anon` name. One limit remains and is not defended against: the
+namespace is per network namespace, so two containers that do not share one
+can each bind the name, and would then both stream if they also share a fleet
+home.
 
 A running monitor also hashes the script it loaded on each poll and exits when
 the contents change. Python reads the whole file once at startup, so without

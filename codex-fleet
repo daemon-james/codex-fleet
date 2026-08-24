@@ -21,6 +21,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tarfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1184,11 +1185,24 @@ def events_lock_name(owner):
     removes the name, and the next monitor creates a fresh file, locks that
     instead, and both stream. Verified against a real flock implementation.
 
-    An abstract name cannot be deleted by anyone, binding it is atomic, and the
-    kernel drops it when the process exits however it exits. There is nothing
-    to clean up and nothing to corrupt.
+    Hashed rather than spelled out, for three reasons found by review:
+      - Abstract names are capped at 107 bytes. An owner of 89 characters made
+        bind() fail, and the caller read that failure as "somebody else holds
+        it", so the FIRST monitor refused itself and no notifications arrived.
+        A digest is always the same length.
+      - The user id and the fleet home go into it, so two people on one host,
+        or one person with two installations, do not collide on the shared
+        "anon" name.
+      - It cannot be made invalid by whatever a session id happens to contain.
+
+    The namespace is per network namespace, so two containers that do not
+    share one can each bind this name. They would also have to share
+    CODEX_FLEET_HOME to be watching the same runs. Documented, not defended
+    against: nothing inside a container can see the other one to check.
     """
-    return "\0codex-fleet-events-" + (owner or "anon")
+    seed = f"{os.getuid()}\0{ROOT}\0{owner or 'anon'}"
+    digest = hashlib.blake2b(seed.encode(), digest_size=16).hexdigest()
+    return "\0codex-fleet-events-" + digest
 
 
 def claim_events_lock(owner):
@@ -1545,10 +1559,75 @@ def branch_is_landed(root, base, branch):
     return identical.returncode == 0
 
 
-# What codex-fleet itself puts into a worktree. Git ignores these in most
-# projects, so they have to be checked by hand, and an unmodified copy of one
-# is not the agent's work.
-SPAWN_PLACED = ("node_modules", ".env", ".env.local")
+# What codex-fleet itself puts into a worktree, plus the whole .env family.
+# Git ignores these in most projects, so they have to be checked by hand, and
+# an unmodified copy of one is not the agent's work. The family rather than
+# two literal names because a review pointed out that .env.development.local
+# and its relatives are just as unrecoverable and were being treated as
+# disposable; one the agent CREATED has no copy to compare against, so it
+# refuses the removal.
+SPAWN_PLACED_DIRS = ("node_modules",)
+
+
+def is_spawn_placed(top):
+    return top in SPAWN_PLACED_DIRS or top == ".env" or top.startswith(".env.")
+
+
+# Ignored files are copied into the run directory before the worktree goes, so
+# a deletion is recoverable rather than merely reported. Bounded, because the
+# reason ignored files are not simply protected is that a built worktree here
+# holds 414 of them and tens of megabytes: build output is what these limits
+# are meant to exclude, and anything excluded is named.
+GC_ARCHIVE_BUDGET_BYTES = 5 * 1024 * 1024
+GC_ARCHIVE_MAX_FILE_BYTES = 1024 * 1024
+GC_ARCHIVE_MAX_FILES = 5000
+
+
+def archive_ignored(worktree, paths, destination):
+    """Copy ignored files into `destination` before their worktree is removed.
+
+    Returns (archived_count, skipped_paths, truncated). A skipped path is one
+    too large to be worth keeping, which in practice means build output. The
+    caller prints those, so nothing disappears without a line naming it.
+    """
+    candidates, truncated = [], False
+    for rel in paths:
+        source = Path(worktree) / rel
+        if source.is_symlink():
+            continue
+        if source.is_dir():
+            for found in sorted(source.rglob("*")):
+                if len(candidates) >= GC_ARCHIVE_MAX_FILES:
+                    truncated = True
+                    break
+                if found.is_file() and not found.is_symlink():
+                    candidates.append(found)
+        elif source.is_file():
+            candidates.append(source)
+        if truncated:
+            break
+
+    kept, skipped, total = [], [], 0
+    for found in candidates:
+        try:
+            size = found.stat().st_size
+        except OSError:
+            continue
+        if size > GC_ARCHIVE_MAX_FILE_BYTES or total + size > GC_ARCHIVE_BUDGET_BYTES:
+            skipped.append(str(found.relative_to(worktree)))
+            continue
+        kept.append(found)
+        total += size
+
+    if kept:
+        try:
+            with tarfile.open(destination, "w:gz") as tar:
+                for found in kept:
+                    tar.add(found, arcname=str(found.relative_to(worktree)))
+        except OSError:
+            # Failing to archive must not turn into failing to report.
+            return 0, skipped + [str(f.relative_to(worktree)) for f in kept], truncated
+    return len(kept), skipped, truncated
 
 
 def worktree_dirt(worktree, root):
@@ -1594,10 +1673,10 @@ def worktree_dirt(worktree, root):
             continue
         rel = line[3:].strip().strip('"').rstrip("/")
         top = rel.split("/")[0]
-        if top not in SPAWN_PLACED:
+        if not is_spawn_placed(top):
             disposable.append(rel)
             continue
-        if top == "node_modules":
+        if top in SPAWN_PLACED_DIRS:
             continue  # a symlink into the parent checkout, nothing of its own
         try:
             if (Path(root) / rel).read_bytes() != (Path(worktree) / rel).read_bytes():
@@ -1643,12 +1722,19 @@ def sweep_worktrees(dry_run=False):
             refused.append((name, f"branch {branch} holds work not in {base}"))
             continue
         if dry_run:
-            removed.append((name, wt, disposable))
+            removed.append((name, wt, disposable, 0, [], False))
             continue
+        # Copy before deleting, never after. A removal that could not be
+        # archived is still reported in full.
+        archived, skipped, truncated = (0, [], False)
+        if disposable:
+            archived, skipped, truncated = archive_ignored(
+                wt, disposable, run_dir(name) / "ignored-files.tar.gz"
+            )
         if remove_worktree(meta):
             meta.pop("worktree", None)
             save_meta(name, meta)
-            removed.append((name, wt, disposable))
+            removed.append((name, wt, disposable, archived, skipped, truncated))
         else:
             refused.append((name, "git refused to remove the worktree"))
     return removed, refused
@@ -1717,13 +1803,21 @@ def cmd_gc(args):
           + (f": {', '.join(deleted)}" if deleted else ""))
     print(f"{verb3} {len(removed)} worktree(s)"
           + (f": {', '.join(entry[0] for entry in removed)}" if removed else ""))
-    for entry in removed:
-        disposable = entry[2]
+    for name, _wt, disposable, archived, skipped, truncated in removed:
         if not disposable:
             continue
         shown = ", ".join(disposable[:4])
         rest = f" and {len(disposable) - 4} more" if len(disposable) > 4 else ""
-        print(f"  {entry[0]} also took {len(disposable)} ignored file(s): {shown}{rest}")
+        print(f"  {name} also took {len(disposable)} ignored path(s): {shown}{rest}")
+        if archived:
+            print(f"    {archived} kept in {run_dir(name) / 'ignored-files.tar.gz'}")
+        if skipped:
+            head = ", ".join(skipped[:3])
+            more = f" and {len(skipped) - 3} more" if len(skipped) > 3 else ""
+            print(f"    {len(skipped)} too large to keep, gone for good: {head}{more}")
+        if truncated:
+            print(f"    stopped looking after {GC_ARCHIVE_MAX_FILES} files; "
+                  f"anything past that was not archived")
     for name in failed:
         print(f"  COULD NOT delete {name}: it is still on disk")
     for name, why in refused:

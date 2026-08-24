@@ -1120,6 +1120,35 @@ class GcRetentionTests(FleetTempHome):
         self.assertIn("would delete", out)
         self.assertIn("ancient", out)
 
+    def test_a_delete_that_did_not_happen_is_not_reported_as_done(self):
+        """shutil.rmtree(ignore_errors=True) hides a permission or filesystem
+        failure, so the directory can survive while gc says it went."""
+        run = self._collapsed_run("stubborn", pruned_days_ago=20)
+        with mock.patch.object(cf.shutil, "rmtree", lambda *a, **k: None):
+            out = self._gc(delete_days=14)
+
+        self.assertTrue(run.exists())
+        self.assertIn("COULD NOT delete stubborn", out)
+        self.assertIn("deleted 0 collapsed run(s)", out)
+
+    def test_freed_space_is_measured_in_bytes_not_rounded_display_values(self):
+        """Summing the printed per-run figures added up numbers already rounded
+        to one decimal megabyte: four 60 KB logs were reported as 0.4 MB when
+        0.23 MB actually went."""
+        old = time.time() - 10 * 86400
+        for i in range(4):
+            run = self.runs / f"r{i}"
+            run.mkdir()
+            (run / "meta.json").write_text(json.dumps(
+                {"name": f"r{i}", "turns": 1, "pid": None, "thread_id": "t"}))
+            log = run / "turn-1.jsonl"
+            log.write_bytes(b'{"type":"turn.completed"}\n' + b"x" * (60000 - 26))
+            os.utime(log, (old, old))
+
+        out = self._gc(prune_days=2)
+
+        self.assertIn("collapsed 4 run(s), 0.2 MB", out)
+
     def test_quiet_says_nothing_when_there_was_nothing_to_do(self):
         self.assertEqual(self._gc(quiet=True).strip(), "")
 
@@ -1176,7 +1205,7 @@ class WorktreeSweepTests(FleetTempHome):
 
         removed, refused = cf.sweep_worktrees()
 
-        self.assertEqual([n for n, _ in removed], ["squashed"])
+        self.assertEqual([e[0] for e in removed], ["squashed"])
         self.assertEqual(refused, [])
         self.assertFalse(wt.exists())
 
@@ -1190,7 +1219,7 @@ class WorktreeSweepTests(FleetTempHome):
 
         removed, refused = cf.sweep_worktrees()
 
-        self.assertEqual([n for n, _ in removed], ["merged"])
+        self.assertEqual([e[0] for e in removed], ["merged"])
         self.assertFalse(wt.exists())
 
     def test_a_branch_holding_unmerged_work_is_refused_and_kept(self):
@@ -1217,6 +1246,106 @@ class WorktreeSweepTests(FleetTempHome):
         self.assertEqual(removed, [])
         self.assertEqual(refused, [("dirty", "uncommitted changes")])
         self.assertTrue(wt.exists())
+
+    def test_an_edited_env_file_is_refused_even_though_git_ignores_it(self):
+        """`git status --porcelain` says nothing about ignored files, and
+        `git worktree remove --force` deletes them anyway. spawn copies .env
+        into every worktree, so an agent that edited one had that edit
+        destroyed with no warning."""
+        root = self._repo()
+        (root / ".gitignore").write_text(".env\n")
+        (root / ".env").write_text("the original\n")
+        self._git("add", ".gitignore", cwd=root)
+        self._git("commit", "-qm", "ignore env", cwd=root)
+        wt = self._run_with_worktree("envy", root, "fleet/envy")
+        (wt / ".env").write_text("the agent changed this\n")
+        self.assertEqual(
+            "", self._git("status", "--porcelain", cwd=wt).stdout.strip(),
+            "fixture is wrong: git must consider this worktree clean",
+        )
+
+        removed, refused = cf.sweep_worktrees()
+
+        self.assertEqual(removed, [])
+        self.assertEqual([n for n, _ in refused], ["envy"])
+        self.assertIn(".env", refused[0][1])
+        self.assertTrue(wt.exists())
+        self.assertEqual((wt / ".env").read_text(), "the agent changed this\n")
+
+    def test_an_untouched_env_copy_does_not_block_the_sweep(self):
+        """The refusal has to be about the agent's work, not about the file
+        spawn put there. Refusing on an unmodified copy would mean no worktree
+        is ever swept in any project that ignores .env."""
+        root = self._repo()
+        (root / ".gitignore").write_text(".env\n")
+        (root / ".env").write_text("the original\n")
+        self._git("add", ".gitignore", cwd=root)
+        self._git("commit", "-qm", "ignore env", cwd=root)
+        wt = self._run_with_worktree("copied", root, "fleet/copied")
+        (wt / ".env").write_text("the original\n")
+
+        removed, refused = cf.sweep_worktrees()
+
+        self.assertEqual([e[0] for e in removed], ["copied"])
+        self.assertFalse(wt.exists())
+
+    def test_other_ignored_files_are_destroyed_but_never_silently(self):
+        """A project's .gitignore is its own statement that these files are
+        reproducible, and a worktree holds hundreds of them after a build: 414
+        in the main checkout here. Refusing on all of them would mean no
+        worktree is ever removed. So they go, and they are named."""
+        root = self._repo()
+        (root / ".gitignore").write_text("build/\n")
+        self._git("add", ".gitignore", cwd=root)
+        self._git("commit", "-qm", "ignore build", cwd=root)
+        wt = self._run_with_worktree("built", root, "fleet/built")
+        (wt / "build").mkdir()
+        (wt / "build" / "out.js").write_text("compiled\n")
+
+        removed, refused = cf.sweep_worktrees()
+
+        self.assertEqual([e[0] for e in removed], ["built"], refused)
+        self.assertEqual(removed[0][2], ["build"])
+        self.assertFalse(wt.exists())
+
+    def test_the_report_names_what_the_removal_took_with_it(self):
+        root = self._repo()
+        (root / ".gitignore").write_text("build/\nlogs/\n")
+        self._git("add", ".gitignore", cwd=root)
+        self._git("commit", "-qm", "ignore", cwd=root)
+        wt = self._run_with_worktree("noisy", root, "fleet/noisy")
+        for d in ("build", "logs"):
+            (wt / d).mkdir()
+            (wt / d / "f").write_text("x")
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cf.cmd_gc(argparse.Namespace(
+                prune_days=2, delete_days=14, dry_run=False, quiet=False))
+        out = buf.getvalue()
+
+        self.assertIn("noisy also took 2 ignored file(s)", out)
+        self.assertIn("build", out)
+        self.assertIn("logs", out)
+
+    def test_the_node_modules_symlink_does_not_block_the_sweep(self):
+        """spawn links node_modules into every worktree and git ignores it.
+        Treating that as the agent's work would mean no worktree is ever swept
+        in any project with dependencies installed."""
+        root = self._repo()
+        (root / ".gitignore").write_text("node_modules\n")
+        self._git("add", ".gitignore", cwd=root)
+        self._git("commit", "-qm", "ignore modules", cwd=root)
+        (root / "node_modules").mkdir()
+        (root / "node_modules" / "big.js").write_text("x" * 100)
+        wt = self._run_with_worktree("linked", root, "fleet/linked")
+        os.symlink(root / "node_modules", wt / "node_modules")
+
+        removed, refused = cf.sweep_worktrees()
+
+        self.assertEqual([e[0] for e in removed], ["linked"], refused)
+        self.assertTrue((root / "node_modules" / "big.js").exists(),
+                        "the real node_modules must survive")
 
     def test_a_running_agents_worktree_is_never_swept(self):
         root = self._repo()
@@ -1246,11 +1375,23 @@ class WorktreeSweepTests(FleetTempHome):
     def test_dry_run_sweeps_nothing(self):
         root = self._repo()
         wt = self._run_with_worktree("squashed", root, "fleet/squashed")
+        # Real committed work, squash-merged and committed, so the branch is
+        # genuinely NOT an ancestor of main. Without this the test passed even
+        # with the squash-merge check deleted.
+        (wt / "b.txt").write_text("work\n")
+        self._git("add", "-A", cwd=wt)
+        self._git("commit", "-qm", "the work", cwd=wt)
         self._git("merge", "--squash", "fleet/squashed", cwd=root)
+        self._git("commit", "-qm", "squashed in", cwd=root)
+        self.assertNotEqual(
+            0,
+            self._git("merge-base", "--is-ancestor", "fleet/squashed", "main",
+                      cwd=root).returncode,
+        )
 
         removed, refused = cf.sweep_worktrees(dry_run=True)
 
-        self.assertEqual([n for n, _ in removed], ["squashed"])
+        self.assertEqual([e[0] for e in removed], ["squashed"])
         self.assertTrue(wt.exists())
 
 
@@ -1305,7 +1446,7 @@ class EventsMonitorTests(FleetTempHome):
 
         # side_effect, not return_value: if the refusal ever stops working,
         # this fails fast instead of streaming forever.
-        with mock.patch.object(cf, "script_fingerprint", side_effect=[(1, 1), (2, 2)]):
+        with mock.patch.object(cf, "script_fingerprint", side_effect=["a", "b"]):
             out = self._events(owner="session-a")
 
         self.assertIn("already streaming", out)
@@ -1373,7 +1514,10 @@ class EventsMonitorTests(FleetTempHome):
                 try:
                     barrier.wait(timeout=10)
                     won = cf.claim_events_lock(owner) is None
-                    time.sleep(0.4)
+                    # Hold well past the slowest sibling's claim. A winner that
+                    # exits early frees the lock and a late child becomes a
+                    # second legitimate winner, which is a flaky test, not a bug.
+                    time.sleep(2.0)
                 except Exception:
                     os._exit(2)
                 os._exit(0 if won else 1)
@@ -1386,48 +1530,31 @@ class EventsMonitorTests(FleetTempHome):
             f"exactly one starter may hold the lock, {codes.count(0)} did",
         )
 
+    def test_a_real_edit_to_the_script_changes_its_fingerprint(self):
+        """The loop test mocks script_fingerprint, so on its own it proves the
+        loop reacts to a changed value and nothing about whether a changed file
+        produces one. An earlier version recorded only whole-second mtime and
+        size, so a same-size edit with the timestamp restored was invisible.
+        """
+        script = self.temp_path / "fake-codex-fleet"
+        script.write_bytes(b"a" * 500)
+        before_stat = script.stat()
+
+        with mock.patch.object(cf, "__file__", str(script)):
+            before = cf.script_fingerprint()
+            # Same size, timestamp put back exactly, which is what an atomic
+            # replacement or a careless restore looks like.
+            script.write_bytes(b"b" * 500)
+            os.utime(script, ns=(before_stat.st_atime_ns, before_stat.st_mtime_ns))
+            after = cf.script_fingerprint()
+
+        self.assertNotEqual(before, after)
+
     def test_the_monitor_exits_when_the_script_it_loaded_has_changed(self):
-        with mock.patch.object(cf, "script_fingerprint", side_effect=[(1, 1), (2, 2)]):
+        with mock.patch.object(cf, "script_fingerprint", side_effect=["a", "b"]):
             out = self._events()
 
         self.assertIn("codex-fleet was updated", out)
-
-    def test_only_one_of_many_simultaneous_starters_gets_the_lock(self):
-        """The read-then-write version let two monitors both see a free lock
-        and both proceed, which is how you get duplicate notifications from two
-        streams that disagree about what is new.
-
-        Real forked processes, not threads: threads share one pid, so each one
-        legitimately reads the lock as its own and the test proves nothing. A
-        barrier makes them all call claim at the same instant, which is the
-        only moment the old read-then-write version was wrong. Each child then
-        stays alive while the others try, because a holder that has already
-        exited SHOULD be displaced.
-        """
-        cf.ROOT.mkdir(parents=True, exist_ok=True)
-        import multiprocessing
-
-        workers = 8
-        barrier = multiprocessing.get_context("fork").Barrier(workers)
-        children = []
-        for _ in range(workers):
-            pid = os.fork()
-            if pid == 0:  # child
-                try:
-                    barrier.wait(timeout=10)
-                    won = cf.claim_events_lock("race") is None
-                    time.sleep(0.4)
-                except Exception:
-                    os._exit(2)
-                os._exit(0 if won else 1)
-            children.append(pid)
-
-        codes = [os.waitpid(pid, 0)[1] >> 8 for pid in children]
-        self.assertNotIn(2, codes, "a child failed before it could claim")
-        self.assertEqual(
-            codes.count(0), 1,
-            f"exactly one starter may take a free lock, {codes.count(0)} did",
-        )
 
     def test_only_one_starter_wins_when_they_all_take_over_a_dead_lock(self):
         """The other half of the race, and the one the first test misses.
@@ -1469,14 +1596,39 @@ class EventsMonitorTests(FleetTempHome):
             "the dead holder must actually be displaced",
         )
 
+    def test_deleting_the_lock_file_cannot_start_a_second_stream(self):
+        """Every disk-based lock I tried could be defeated by deleting the
+        file: the holder locks an inode, somebody removes the name, and the
+        next monitor creates a fresh file, locks that, and both stream. The
+        lock is a kernel-held name now, so the file is only a breadcrumb."""
+        cf.ROOT.mkdir(parents=True, exist_ok=True)
+        self._hold_lock_in_a_child("session-a")
+        self.assertTrue(cf.events_lock_path("session-a").exists())
+
+        cf.events_lock_path("session-a").unlink()
+
+        self.assertIsNotNone(
+            cf.claim_events_lock("session-a"),
+            "a second stream started because someone deleted a file",
+        )
+
+    def test_a_lock_whose_breadcrumb_is_gone_still_refuses_clearly(self):
+        cf.ROOT.mkdir(parents=True, exist_ok=True)
+        self._hold_lock_in_a_child("session-a")
+        cf.events_lock_path("session-a").unlink()
+
+        with mock.patch.object(cf, "script_fingerprint", side_effect=["a", "b"]):
+            out = self._events(owner="session-a")
+
+        self.assertIn("already streaming", out)
+        self.assertIn("another process", out)
+
     def test_the_monitor_frees_the_lock_when_it_exits(self):
-        """Freed, not deleted. Unlinking would let the next starter create a
-        different file and lock that instead, and both would believe they were
-        the only stream."""
-        with mock.patch.object(cf, "script_fingerprint", side_effect=[(1, 1), (2, 2)]):
+        """A monitor that exits must leave the stream claimable, or re-arming
+        after an update would refuse forever."""
+        with mock.patch.object(cf, "script_fingerprint", side_effect=["a", "b"]):
             self._events(owner="session-a")
 
-        self.assertTrue(cf.events_lock_path("session-a").exists())
         self.assertIsNone(cf.claim_events_lock("session-a"))
         cf.release_events_lock("session-a")
 

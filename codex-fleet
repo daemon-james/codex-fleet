@@ -11,12 +11,14 @@ import argparse
 import contextlib
 import errno
 import fcntl
+import hashlib
 import io
 import json
 import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -1170,80 +1172,89 @@ def events_lock_path(owner):
     return ROOT / f"events-{owner or 'anon'}.lock"
 
 
-_events_lock_fd = None
+_events_lock_socket = None
+
+
+def events_lock_name(owner):
+    """The kernel-held name for one session's stream.
+
+    A leading NUL puts this in Linux's abstract socket namespace, which has no
+    filesystem entry at all. That is the point: every disk-based lock I tried
+    could be defeated by deleting the file. A holder locks an inode, somebody
+    removes the name, and the next monitor creates a fresh file, locks that
+    instead, and both stream. Verified against a real flock implementation.
+
+    An abstract name cannot be deleted by anyone, binding it is atomic, and the
+    kernel drops it when the process exits however it exits. There is nothing
+    to clean up and nothing to corrupt.
+    """
+    return "\0codex-fleet-events-" + (owner or "anon")
 
 
 def claim_events_lock(owner):
     """Take the stream lock, or report the monitor that already holds it.
 
-    An advisory lock, not a pid written to a file. Two earlier attempts were
-    both racy for the same reason: reading who holds the lock and then writing
-    your own claim are separate steps, and any number of starters can pass the
-    read before the first one writes. Creating the file exclusively did not fix
-    it either, because the file exists for a moment before the pid is written
-    to it, and starters that looked in that window read an empty file and took
-    the lock. Eight forked processes all "won" in that version.
+    Three earlier versions were all racy in the same way: reading who holds the
+    lock and then writing your own claim are separate steps, so any number of
+    starters pass the read before the first one writes. Eight forked processes
+    all won. Creating the file exclusively did not help either, because the
+    file exists for a moment before the pid is written into it and starters
+    that looked in that window read an empty file and took the lock.
 
-    The kernel does not have that problem. A process holds the lock or it does
-    not, the test and the claim are one operation, and the lock is dropped
-    automatically when the holder exits for any reason. That also deletes the
-    stale-lock problem outright: there is no such thing as a lock left behind
-    by a crashed monitor.
+    Binding a name has none of that. The test and the claim are one operation
+    the kernel performs, and it releases the name when the process dies.
 
-    The file itself carries the holder's pid purely so a human, or the refusal
-    message, can say who is streaming. Nothing depends on that number, and the
-    file is never unlinked: another starter would create a fresh one and lock
-    that instead, and the two would both think they were exclusive.
+    The pid file alongside it is a breadcrumb for the refusal message and for
+    anyone reading the directory. Nothing depends on it, and deleting it costs
+    a helpful message rather than correctness.
     """
-    global _events_lock_fd
-    path = events_lock_path(owner)
-    ROOT.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    global _events_lock_socket
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM | socket.SOCK_CLOEXEC)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        sock.bind(events_lock_name(owner))
     except OSError:
+        sock.close()
         try:
-            holder = int(os.pread(fd, 32, 0).decode().strip())
+            holder = int(events_lock_path(owner).read_text().strip())
         except (OSError, ValueError):
-            # Held, but the holder has not written its pid yet.
             holder = -1
-        os.close(fd)
         return holder if holder != 0 else -1
-    os.ftruncate(fd, 0)
-    os.pwrite(fd, str(os.getpid()).encode(), 0)
-    _events_lock_fd = fd
+    _events_lock_socket = sock
+    try:
+        ROOT.mkdir(parents=True, exist_ok=True)
+        events_lock_path(owner).write_text(str(os.getpid()))
+    except OSError:
+        pass  # the breadcrumb is optional; the lock is already held
     return None
 
 
 def release_events_lock(owner):
     """Drop the lock. Exiting would do this anyway; being explicit is clearer."""
-    global _events_lock_fd
-    if _events_lock_fd is None:
+    global _events_lock_socket
+    if _events_lock_socket is None:
         return
     try:
-        fcntl.flock(_events_lock_fd, fcntl.LOCK_UN)
-    except OSError:
-        pass
+        _events_lock_socket.close()
     finally:
-        try:
-            os.close(_events_lock_fd)
-        except OSError:
-            pass
-        _events_lock_fd = None
+        _events_lock_socket = None
 
 
 def script_fingerprint():
-    """Size and modification time of the script this process is running.
+    """A digest of the script this process is running.
 
     Python reads the whole file at startup and never looks again, so an events
     monitor keeps running the version it loaded no matter how many times the
     tool is rewritten. One ran for two days on code that had been replaced 21
     minutes after it started, which is why it still had no session filter and
     reported every run on the machine into every session.
+
+    The contents, not the metadata. Size and modification time miss an edit
+    that keeps the same length and puts the timestamp back, and the inode
+    misses it too when the file is rewritten in place. Hashing about 100 KB
+    takes well under a millisecond and this runs once every two seconds.
     """
     try:
-        st = Path(__file__).stat()
-        return (st.st_mtime, st.st_size)
+        return hashlib.blake2b(Path(__file__).read_bytes(), digest_size=16).hexdigest()
     except OSError:
         return None
 
@@ -1474,6 +1485,10 @@ def cmd_prune(args):
           f"{kept} newer than {args.older_than}d left alone")
     if touched and not args.dry_run:
         print("Their results and thread ids are kept, so `say` still resumes them.")
+    # Returned in BYTES. Reading the printed line back and summing it gave a
+    # total built from values already rounded to one decimal megabyte, so four
+    # 60 KB logs were reported as 0.4 MB when 0.23 MB went.
+    return touched, freed
 
 
 # How long a finished run keeps its full event log, and how long the collapsed
@@ -1530,7 +1545,32 @@ def branch_is_landed(root, base, branch):
     return identical.returncode == 0
 
 
-def worktree_is_dirty(worktree):
+# What codex-fleet itself puts into a worktree. Git ignores these in most
+# projects, so they have to be checked by hand, and an unmodified copy of one
+# is not the agent's work.
+SPAWN_PLACED = ("node_modules", ".env", ".env.local")
+
+
+def worktree_dirt(worktree, root):
+    """What removing this worktree would cost: (refusal reason, disposables).
+
+    A refusal reason means do not remove it. The disposables are ignored files
+    that WILL be destroyed, listed so the removal is never silent.
+
+    `git status --porcelain` alone is not enough, because it says nothing about
+    ignored files and `git worktree remove --force` deletes them regardless.
+    Found by review on 2026-08-25 with a working reproduction.
+
+    The split is deliberate. A project's .gitignore is its own statement that
+    those files are reproducible, and after an agent runs a build a worktree
+    holds hundreds of them: the main checkout here has 414. Refusing on all of
+    them means no worktree is ever removed and the pile-up this exists to stop
+    carries on. So ignored files are reported, not protected.
+
+    The exception is the files spawn copies IN. Those came from outside the
+    worktree, an edit to one cannot be regenerated, and losing it is silent in
+    a way a deleted build directory is not.
+    """
     r = subprocess.run(
         ["git", "-C", worktree, "status", "--porcelain"],
         capture_output=True, text=True,
@@ -1538,8 +1578,33 @@ def worktree_is_dirty(worktree):
     # A repository that cannot be read is treated as dirty. Refusing to delete
     # is the safe direction when the answer is unknown.
     if r.returncode != 0:
-        return True
-    return bool(r.stdout.strip())
+        return "its git status could not be read", []
+    if r.stdout.strip():
+        return "uncommitted changes", []
+
+    listed = subprocess.run(
+        ["git", "-C", worktree, "status", "--porcelain", "--ignored"],
+        capture_output=True, text=True,
+    )
+    if listed.returncode != 0:
+        return "its ignored files could not be listed", []
+    disposable = []
+    for line in listed.stdout.splitlines():
+        if not line.startswith("!! "):
+            continue
+        rel = line[3:].strip().strip('"').rstrip("/")
+        top = rel.split("/")[0]
+        if top not in SPAWN_PLACED:
+            disposable.append(rel)
+            continue
+        if top == "node_modules":
+            continue  # a symlink into the parent checkout, nothing of its own
+        try:
+            if (Path(root) / rel).read_bytes() != (Path(worktree) / rel).read_bytes():
+                return f"{rel} was edited after it was copied in", []
+        except OSError:
+            return f"{rel} could not be compared with the copy it came from", []
+    return None, disposable
 
 
 def sweep_worktrees(dry_run=False):
@@ -1564,11 +1629,12 @@ def sweep_worktrees(dry_run=False):
         if alive(meta.get("pid")):
             refused.append((name, "agent still running"))
             continue
-        if worktree_is_dirty(wt):
-            refused.append((name, "uncommitted changes"))
-            continue
         root = meta.get("worktree_root")
         branch = meta.get("worktree_branch")
+        dirt, disposable = worktree_dirt(wt, root or wt)
+        if dirt:
+            refused.append((name, dirt))
+            continue
         base = default_branch(root) if root else None
         if not root or not branch or not base:
             refused.append((name, "cannot tell what it should have merged into"))
@@ -1577,12 +1643,12 @@ def sweep_worktrees(dry_run=False):
             refused.append((name, f"branch {branch} holds work not in {base}"))
             continue
         if dry_run:
-            removed.append((name, wt))
+            removed.append((name, wt, disposable))
             continue
         if remove_worktree(meta):
             meta.pop("worktree", None)
             save_meta(name, meta)
-            removed.append((name, wt))
+            removed.append((name, wt, disposable))
         else:
             refused.append((name, "git refused to remove the worktree"))
     return removed, refused
@@ -1596,9 +1662,9 @@ def delete_expired(delete_days, dry_run=False):
     period to be read.
     """
     if delete_days <= 0:
-        return []
+        return [], []
     cutoff = time.time() - delete_days * 86400
-    gone = []
+    gone, failed = [], []
     for name, meta in all_runs():
         pruned_at = meta.get("pruned_at")
         if not pruned_at or alive(meta.get("pid")):
@@ -1611,10 +1677,18 @@ def delete_expired(delete_days, dry_run=False):
             continue
         if when > cutoff:
             continue
-        if not dry_run:
-            shutil.rmtree(run_dir(name), ignore_errors=True)
-        gone.append(name)
-    return gone
+        if dry_run:
+            gone.append(name)
+            continue
+        shutil.rmtree(run_dir(name), ignore_errors=True)
+        # ignore_errors hides a permission or filesystem failure, so confirm
+        # the directory actually went rather than reporting a delete that
+        # silently did not happen.
+        if not run_dir(name).exists():
+            gone.append(name)
+        else:
+            failed.append(name)
+    return gone, failed
 
 
 def cmd_gc(args):
@@ -1626,29 +1700,32 @@ def cmd_gc(args):
     """
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        cmd_prune(argparse.Namespace(older_than=args.prune_days, dry_run=args.dry_run))
-    pruned = [l for l in buf.getvalue().splitlines() if ": pruned," in l or ": would free" in l]
-    freed = 0.0
-    for line in pruned:
-        marker = "freed " if ": pruned," in line else "would free "
-        try:
-            freed += float(line.split(marker)[1].split(" MB")[0])
-        except (IndexError, ValueError):
-            pass
-
-    deleted = delete_expired(args.delete_days, dry_run=args.dry_run)
+        collapsed, freed_bytes = cmd_prune(
+            argparse.Namespace(older_than=args.prune_days, dry_run=args.dry_run)
+        )
+    deleted, failed = delete_expired(args.delete_days, dry_run=args.dry_run)
     removed, refused = sweep_worktrees(dry_run=args.dry_run)
 
-    verb = "would collapse" if args.dry_run else "collapsed"
-    verb2 = "would delete" if args.dry_run else "deleted"
-    verb3 = "would remove" if args.dry_run else "removed"
-    if args.quiet and not (pruned or deleted or removed or refused):
+    if args.quiet and not (collapsed or deleted or failed or removed or refused):
         return
-    print(f"{verb} {len(pruned)} run(s), {freed:.1f} MB")
+    verb, verb2, verb3 = (
+        ("would collapse", "would delete", "would remove") if args.dry_run
+        else ("collapsed", "deleted", "removed")
+    )
+    print(f"{verb} {collapsed} run(s), {freed_bytes / 1024 / 1024:.1f} MB")
     print(f"{verb2} {len(deleted)} collapsed run(s) older than {args.delete_days:g}d"
           + (f": {', '.join(deleted)}" if deleted else ""))
     print(f"{verb3} {len(removed)} worktree(s)"
-          + (f": {', '.join(n for n, _ in removed)}" if removed else ""))
+          + (f": {', '.join(entry[0] for entry in removed)}" if removed else ""))
+    for entry in removed:
+        disposable = entry[2]
+        if not disposable:
+            continue
+        shown = ", ".join(disposable[:4])
+        rest = f" and {len(disposable) - 4} more" if len(disposable) > 4 else ""
+        print(f"  {entry[0]} also took {len(disposable)} ignored file(s): {shown}{rest}")
+    for name in failed:
+        print(f"  COULD NOT delete {name}: it is still on disk")
     for name, why in refused:
         print(f"  kept worktree {name}: {why}")
 

@@ -47,42 +47,59 @@ Run state expires on a schedule so the directory cannot grow without limit.
 | --- | --- | --- |
 | collapse | after 2 days | a finished run loses its event log and keeps its result, token count and thread id, so `say` still resumes it |
 | delete | after 14 days | a collapsed run is removed entirely |
-| sweep | every run | a worktree is removed only when it has no uncommitted changes and its branch adds nothing to the default branch |
+| sweep | every run | a worktree whose work has landed |
 
-The sweep tests for a squash merge as well as an ordinary one, because this
-repository squash-merges and a squashed branch is never an ancestor of `main`
-even though every line of it shipped. A worktree it will not remove is named
-with the reason, because a worktree deleted by mistake is lost work.
+A worktree is swept only when git reports it clean and its branch adds nothing
+to the default branch. That second test allows for a squash merge as well as
+an ordinary one, because this repository squash-merges and a squashed branch
+is never an ancestor of `main` even though every line of it shipped.
 
-It runs at the end of every `spawn`, and from cron at 06:30 daily for the
-weeks nobody spawns anything. Pruning used to run only on spawn, which meant a
-fleet that went quiet kept everything forever.
+Ignored files need their own rule, because `git status` does not mention them
+and `git worktree remove --force` deletes them anyway. Two kinds, treated
+differently:
+
+- **The files spawn copied in**, `.env` and `.env.local`, refuse the removal
+  when they have been edited. They came from outside the worktree, so an edit
+  cannot be regenerated and losing it would be silent.
+- **Everything else the project ignores** is destroyed and named in the
+  output. A .gitignore is the project's own statement that those files are
+  reproducible, and a worktree holds hundreds of them after a build. Refusing
+  on all of them would mean no worktree is ever removed, which is the pile-up
+  this exists to prevent.
+
+Anything not removed is named with the reason. It runs at the end of every
+`spawn`, and `install.sh` adds a 06:30 cron entry for the weeks nobody spawns
+anything. Pruning used to run only on spawn, so a fleet that went quiet kept
+everything forever.
 
 `--dry-run` changes nothing. `--delete-days 0` never deletes. Override the
 defaults with `CODEX_FLEET_PRUNE_DAYS` and `CODEX_FLEET_DELETE_DAYS`.
 
 ## One stream per session
 
-`codex-fleet events` holds an advisory lock on a file named after the session
-that owns it. A second monitor for the same session refuses to start and names
-the process already streaming, rather than delivering every notification twice
-from two streams with separate memories of what they had already reported.
-Different sessions take different locks and are unaffected.
+`codex-fleet events` claims a name in the kernel, one per session. A second
+monitor for the same session refuses to start and names the process already
+streaming, rather than delivering every notification twice from two streams
+with separate memories of what they had already reported. Different sessions
+claim different names and are unaffected.
 
-The lock belongs to the running process, so the kernel drops it the moment
-that process exits, however it exits. A monitor killed with SIGKILL leaves its
-lock file on disk and the next monitor still starts normally; there is no
-stale lock to clear and nothing for anyone to clean up by hand. The pid inside
-the file exists only so the refusal message can say who is streaming, and the
-file is never deleted, because a second starter would create a fresh one and
-lock that instead while both believed they were exclusive.
+The name is held by the running process, so the kernel releases it the moment
+that process exits, however it exits, and there is no stale lock to clear. It
+lives in Linux's abstract socket namespace and has no filesystem entry, which
+matters more than it sounds: every disk-based version of this could be
+defeated by deleting the file, because the holder locks an inode and the next
+monitor simply creates a new file and locks that instead. The pid file beside
+it is a breadcrumb for the refusal message. Deleting it costs a helpful
+message, not correctness.
 
-A running monitor also checks whether the script it loaded has changed, and
-exits when it has. Python reads the whole file once at startup, so without
+A running monitor also hashes the script it loaded on each poll and exits when
+the contents change. Python reads the whole file once at startup, so without
 this a monitor keeps running the version it started with no matter how many
 times the tool is rewritten. One ran for two days on code that had been
 replaced 21 minutes after it started, which is why it still had no session
-filter and reported every run on the machine into every session.
+filter and reported every run on the machine into every session. Size and
+timestamp are not enough on their own: an edit that keeps the same length and
+puts the timestamp back leaves both unchanged.
 
 ## Session ownership
 

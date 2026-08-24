@@ -1275,44 +1275,115 @@ class EventsMonitorTests(FleetTempHome):
                         cf.cmd_events(argparse.Namespace(all=False))
         return buf.getvalue()
 
+    def _hold_lock_in_a_child(self, owner):
+        """Fork a child that really holds the lock and stays alive.
+
+        The lock is a property of a live process now, so a test cannot fake a
+        holder by writing a pid into a file. Returns the child's pid; the
+        caller gets it killed and reaped on cleanup.
+        """
+        ready_r, ready_w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            try:
+                got = cf.claim_events_lock(owner) is None
+                os.write(ready_w, b"y" if got else b"n")
+                time.sleep(30)
+            except Exception:
+                pass
+            os._exit(0)
+        os.close(ready_w)
+        self.addCleanup(lambda: os.waitpid(pid, 0))
+        self.addCleanup(lambda: os.kill(pid, 9))
+        self.assertEqual(os.read(ready_r, 1), b"y", "the child failed to take the lock")
+        os.close(ready_r)
+        return pid
+
     def test_a_second_monitor_for_the_same_session_refuses_to_start(self):
         cf.ROOT.mkdir(parents=True, exist_ok=True)
-        # A real other process, because the holder check has to tell
-        # "someone else is streaming" apart from "this is my own lock".
-        other = subprocess.Popen(["sleep", "30"])
-        self.addCleanup(other.wait)
-        self.addCleanup(other.kill)
-        cf.events_lock_path("session-a").write_text(str(other.pid))
+        holder = self._hold_lock_in_a_child("session-a")
 
         # side_effect, not return_value: if the refusal ever stops working,
-        # this test fails fast instead of streaming forever.
+        # this fails fast instead of streaming forever.
         with mock.patch.object(cf, "script_fingerprint", side_effect=[(1, 1), (2, 2)]):
             out = self._events(owner="session-a")
 
         self.assertIn("already streaming", out)
-        self.assertIn(str(other.pid), out)
-        self.assertEqual(
-            cf.events_lock_path("session-a").read_text().strip(), str(other.pid),
-            "the refused monitor must not steal the live holder's lock",
-        )
+        self.assertIn(str(holder), out)
 
-    def test_a_lock_left_by_a_dead_monitor_is_taken_over(self):
+    def test_the_lock_a_dead_monitor_held_is_free_for_the_next_one(self):
+        """A crashed monitor must not disable notifications until somebody
+        finds a file they do not know exists. The kernel drops the lock when
+        the process dies, so there is nothing to clean up."""
         cf.ROOT.mkdir(parents=True, exist_ok=True)
-        # A pid that cannot be alive.
-        cf.events_lock_path("session-a").write_text("999999999")
+        pid = os.fork()
+        if pid == 0:
+            cf.claim_events_lock("session-a")
+            os._exit(0)  # dies while "holding" it
+        os.waitpid(pid, 0)
+        time.sleep(0.2)
 
         self.assertIsNone(cf.claim_events_lock("session-a"))
-        self.assertEqual(
-            cf.events_lock_path("session-a").read_text().strip(), str(os.getpid())
-        )
+        cf.release_events_lock("session-a")
 
     def test_two_different_sessions_each_get_their_own_stream(self):
         cf.ROOT.mkdir(parents=True, exist_ok=True)
-        cf.events_lock_path("session-a").write_text(str(os.getpid()))
+        self._hold_lock_in_a_child("session-a")
 
         self.assertIsNone(cf.claim_events_lock("session-b"))
+        cf.release_events_lock("session-b")
         self.assertNotEqual(
             cf.events_lock_path("session-a"), cf.events_lock_path("session-b")
+        )
+
+    def test_only_one_of_many_simultaneous_starters_gets_the_lock(self):
+        """Read-then-write let every starter see a free lock and proceed, which
+        is how you get duplicate notifications from two streams that disagree
+        about what is new.
+
+        Real forked processes, not threads, and a barrier so they all claim at
+        the same instant. Each child stays alive while the others try.
+        """
+        cf.ROOT.mkdir(parents=True, exist_ok=True)
+        self._assert_exactly_one_winner("race")
+
+    def test_only_one_starter_wins_when_the_previous_holder_has_died(self):
+        """The other half: the lock file already exists and its last holder is
+        gone, so every starter is entitled to it and they must still not all
+        take it."""
+        cf.ROOT.mkdir(parents=True, exist_ok=True)
+        pid = os.fork()
+        if pid == 0:
+            cf.claim_events_lock("dead-race")
+            os._exit(0)
+        os.waitpid(pid, 0)
+        time.sleep(0.2)
+        self.assertTrue(cf.events_lock_path("dead-race").exists())
+
+        self._assert_exactly_one_winner("dead-race")
+
+    def _assert_exactly_one_winner(self, owner, workers=8):
+        import multiprocessing
+
+        barrier = multiprocessing.get_context("fork").Barrier(workers)
+        children = []
+        for _ in range(workers):
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    barrier.wait(timeout=10)
+                    won = cf.claim_events_lock(owner) is None
+                    time.sleep(0.4)
+                except Exception:
+                    os._exit(2)
+                os._exit(0 if won else 1)
+            children.append(pid)
+
+        codes = [os.waitpid(pid, 0)[1] >> 8 for pid in children]
+        self.assertNotIn(2, codes, "a child failed before it could claim")
+        self.assertEqual(
+            codes.count(0), 1,
+            f"exactly one starter may hold the lock, {codes.count(0)} did",
         )
 
     def test_the_monitor_exits_when_the_script_it_loaded_has_changed(self):
@@ -1321,9 +1392,91 @@ class EventsMonitorTests(FleetTempHome):
 
         self.assertIn("codex-fleet was updated", out)
 
-    def test_the_monitor_releases_its_lock_when_it_exits(self):
+    def test_only_one_of_many_simultaneous_starters_gets_the_lock(self):
+        """The read-then-write version let two monitors both see a free lock
+        and both proceed, which is how you get duplicate notifications from two
+        streams that disagree about what is new.
+
+        Real forked processes, not threads: threads share one pid, so each one
+        legitimately reads the lock as its own and the test proves nothing. A
+        barrier makes them all call claim at the same instant, which is the
+        only moment the old read-then-write version was wrong. Each child then
+        stays alive while the others try, because a holder that has already
+        exited SHOULD be displaced.
+        """
+        cf.ROOT.mkdir(parents=True, exist_ok=True)
+        import multiprocessing
+
+        workers = 8
+        barrier = multiprocessing.get_context("fork").Barrier(workers)
+        children = []
+        for _ in range(workers):
+            pid = os.fork()
+            if pid == 0:  # child
+                try:
+                    barrier.wait(timeout=10)
+                    won = cf.claim_events_lock("race") is None
+                    time.sleep(0.4)
+                except Exception:
+                    os._exit(2)
+                os._exit(0 if won else 1)
+            children.append(pid)
+
+        codes = [os.waitpid(pid, 0)[1] >> 8 for pid in children]
+        self.assertNotIn(2, codes, "a child failed before it could claim")
+        self.assertEqual(
+            codes.count(0), 1,
+            f"exactly one starter may take a free lock, {codes.count(0)} did",
+        )
+
+    def test_only_one_starter_wins_when_they_all_take_over_a_dead_lock(self):
+        """The other half of the race, and the one the first test misses.
+
+        When the lock is free, exactly one process can create it. When the lock
+        exists but its holder is DEAD, every starter is entitled to take it,
+        so they all overwrite it and without a confirmation step they all
+        believe they hold it. The winner is whoever wrote last, and everyone
+        else has to discover that by reading the file back.
+        """
+        cf.ROOT.mkdir(parents=True, exist_ok=True)
+        # Above pid_max, so it can never be a live process.
+        cf.events_lock_path("dead-race").write_text("999999999")
+        import multiprocessing
+
+        workers = 8
+        barrier = multiprocessing.get_context("fork").Barrier(workers)
+        children = []
+        for _ in range(workers):
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    barrier.wait(timeout=10)
+                    won = cf.claim_events_lock("dead-race") is None
+                    time.sleep(0.4)
+                except Exception:
+                    os._exit(2)
+                os._exit(0 if won else 1)
+            children.append(pid)
+
+        codes = [os.waitpid(pid, 0)[1] >> 8 for pid in children]
+        self.assertNotIn(2, codes, "a child failed before it could claim")
+        self.assertEqual(
+            codes.count(0), 1,
+            f"exactly one starter may take over a dead lock, {codes.count(0)} did",
+        )
+        self.assertNotEqual(
+            cf.events_lock_path("dead-race").read_text().strip(), "999999999",
+            "the dead holder must actually be displaced",
+        )
+
+    def test_the_monitor_frees_the_lock_when_it_exits(self):
+        """Freed, not deleted. Unlinking would let the next starter create a
+        different file and lock that instead, and both would believe they were
+        the only stream."""
         with mock.patch.object(cf, "script_fingerprint", side_effect=[(1, 1), (2, 2)]):
             self._events(owner="session-a")
 
-        self.assertFalse(cf.events_lock_path("session-a").exists())
+        self.assertTrue(cf.events_lock_path("session-a").exists())
+        self.assertIsNone(cf.claim_events_lock("session-a"))
+        cf.release_events_lock("session-a")
 

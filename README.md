@@ -63,12 +63,19 @@ defaults with `CODEX_FLEET_PRUNE_DAYS` and `CODEX_FLEET_DELETE_DAYS`.
 
 ## One stream per session
 
-`codex-fleet events` takes a lock named after the session that owns it. A
-second monitor for the same session refuses to start and names the process
-already streaming, rather than delivering every notification twice with two
-separate memories of what it already reported. A lock left by a killed monitor
-is taken over, so a crash cannot disable notifications until someone finds a
-file they do not know exists.
+`codex-fleet events` holds an advisory lock on a file named after the session
+that owns it. A second monitor for the same session refuses to start and names
+the process already streaming, rather than delivering every notification twice
+from two streams with separate memories of what they had already reported.
+Different sessions take different locks and are unaffected.
+
+The lock belongs to the running process, so the kernel drops it the moment
+that process exits, however it exits. A monitor killed with SIGKILL leaves its
+lock file on disk and the next monitor still starts normally; there is no
+stale lock to clear and nothing for anyone to clean up by hand. The pid inside
+the file exists only so the refusal message can say who is streaming, and the
+file is never deleted, because a second starter would create a fresh one and
+lock that instead while both believed they were exclusive.
 
 A running monitor also checks whether the script it loaded has changed, and
 exits when it has. Python reads the whole file once at startup, so without

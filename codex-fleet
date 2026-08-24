@@ -10,6 +10,7 @@ State lives in ~/.codex-fleet/runs/<name>/
 import argparse
 import contextlib
 import errno
+import fcntl
 import io
 import json
 import os
@@ -1169,32 +1170,66 @@ def events_lock_path(owner):
     return ROOT / f"events-{owner or 'anon'}.lock"
 
 
-def claim_events_lock(owner):
-    """Take the stream lock, or report who already holds it.
+_events_lock_fd = None
 
-    A lock left behind by a killed monitor is taken over rather than honoured,
-    because otherwise one crash disables notifications until someone deletes a
-    file they do not know exists.
+
+def claim_events_lock(owner):
+    """Take the stream lock, or report the monitor that already holds it.
+
+    An advisory lock, not a pid written to a file. Two earlier attempts were
+    both racy for the same reason: reading who holds the lock and then writing
+    your own claim are separate steps, and any number of starters can pass the
+    read before the first one writes. Creating the file exclusively did not fix
+    it either, because the file exists for a moment before the pid is written
+    to it, and starters that looked in that window read an empty file and took
+    the lock. Eight forked processes all "won" in that version.
+
+    The kernel does not have that problem. A process holds the lock or it does
+    not, the test and the claim are one operation, and the lock is dropped
+    automatically when the holder exits for any reason. That also deletes the
+    stale-lock problem outright: there is no such thing as a lock left behind
+    by a crashed monitor.
+
+    The file itself carries the holder's pid purely so a human, or the refusal
+    message, can say who is streaming. Nothing depends on that number, and the
+    file is never unlinked: another starter would create a fresh one and lock
+    that instead, and the two would both think they were exclusive.
     """
+    global _events_lock_fd
     path = events_lock_path(owner)
     ROOT.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
     try:
-        holder = int(path.read_text().strip())
-    except (OSError, ValueError):
-        holder = None
-    if holder and holder != os.getpid() and alive(holder):
-        return holder
-    path.write_text(str(os.getpid()))
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            holder = int(os.pread(fd, 32, 0).decode().strip())
+        except (OSError, ValueError):
+            # Held, but the holder has not written its pid yet.
+            holder = -1
+        os.close(fd)
+        return holder if holder != 0 else -1
+    os.ftruncate(fd, 0)
+    os.pwrite(fd, str(os.getpid()).encode(), 0)
+    _events_lock_fd = fd
     return None
 
 
 def release_events_lock(owner):
-    path = events_lock_path(owner)
+    """Drop the lock. Exiting would do this anyway; being explicit is clearer."""
+    global _events_lock_fd
+    if _events_lock_fd is None:
+        return
     try:
-        if int(path.read_text().strip()) == os.getpid():
-            path.unlink()
-    except (OSError, ValueError):
+        fcntl.flock(_events_lock_fd, fcntl.LOCK_UN)
+    except OSError:
         pass
+    finally:
+        try:
+            os.close(_events_lock_fd)
+        except OSError:
+            pass
+        _events_lock_fd = None
 
 
 def script_fingerprint():
@@ -1241,7 +1276,8 @@ def cmd_events(args):
     owner = current_owner()
     holder = claim_events_lock(owner)
     if holder:
-        print(f"an events monitor is already streaming for this session (pid {holder}); "
+        who = f"pid {holder}" if holder > 0 else "another process"
+        print(f"an events monitor is already streaming for this session ({who}); "
               f"nothing armed, that one is still delivering", flush=True)
         return
     fingerprint = script_fingerprint()

@@ -3,18 +3,57 @@
 Run Codex agents as background subagents you can fan out, watch live, steer
 mid-turn, and be interrupted by.
 
-**This is a development tool. It is not part of Mnemonik and never ships with
-it.** It is used to build Mnemonik, which is why it knows how to authorize
-Mnemonik's MCP tools in an agent brief, but it has no other relationship to that
-product and its code must never be committed there.
+**Experimental, Linux-first developer tool.** Run agents from your terminal or
+let Claude Code orchestrate them. Fleet uses Python's standard library; there
+is no Python dependency installation or frontend build step.
+
+## Requirements and installation
+
+Release checks ran on Linux with Python 3.12.3 and Codex CLI 0.153.4.
+
+- Linux, Python 3.10+, Git, Bash, and `crontab`.
+- A working, authenticated Codex CLI on `PATH`.
+- Access to the models in the role table below. Roles are currently hardcoded;
+  edit `ROLES` and `EFFORTS` in `codex-fleet` if your account uses different models.
+- Claude Code is optional, for orchestration and status notifications.
 
 ```bash
-./install.sh          # symlink the CLI and both hooks into place
-codex-fleet spawn "Trace how X works. Report file:line." -n scout -r engineer -e high -C /path/to/repo
-codex-fleet list      # every run, most recent first
-codex-fleet tell scout "actually, start from the handler"   # reaches it mid-turn
+git clone https://github.com/daemon-james/codex-fleet.git
+cd codex-fleet
+./install.sh
+export PATH="$HOME/.local/bin:$PATH"
+codex-fleet --help
+codex-fleet spawn "Describe this repository. Do not change files." -n scout -C /path/to/repo
+codex-fleet watch scout
 codex-fleet result scout
+codex-fleet serve --daemon --host 127.0.0.1
+# Open http://127.0.0.1:8787
 ```
+
+Keep the checkout: installation creates symlinks into it. Add the PATH export
+to your shell profile if needed. The installer also adds a daily cleanup cron
+job; see Housekeeping below for retention and worktree removal behaviour.
+
+**Execution settings:** this version explicitly launches agents with
+`danger-full-access`. A working directory or Git worktree is not a filesystem
+security boundary. Use Fleet only where you intend to grant that access.
+The dashboard exposes agent prompts, logs and results without authentication.
+Pass `--host 127.0.0.1` for local access; the current default is `0.0.0.0`.
+
+For live steering with `tell`, register the inbox hook as described in
+[SETUP.md](SETUP.md). That guide also covers optional Claude Code hooks.
+Without the inbox hook, messages queue but do not reach running agents.
+
+```bash
+codex-fleet list
+codex-fleet tell scout "Focus on the deployment scripts."
+codex-fleet say scout "Explain the main entry point." # follow up after it finishes
+```
+
+This first release publishes the existing implementation. Linux-specific
+process inspection and socket locking need porting before macOS or native
+Windows support. Model access and hook compatibility depend on your Codex
+installation. Mnemonik is optional; Fleet does not require its service.
 
 Run `codex-fleet serve --daemon` for a detached dashboard, inspect it with `serve --status`, and stop it with `serve --stop`; `list` always reports its address first, ask events retain the full question and blocking flag, `inbox --all` includes read questions, latest-turn MCP success/failure totals appear in `list`, `result`, and finished events, and dashboard polling reads only newly appended turn-log bytes.
 
@@ -57,10 +96,8 @@ remaining and refreshes once a minute.
 
 ## Two guides, two jobs
 
-**Using it** is covered by the Claude Code skill at
-`~/.claude/skills/codex-fleet/SKILL.md`: when to use a worktree, how to brief an
-agent, how to tell a sandbox artefact from a real test failure, what to do with
-idle agents.
+**Using it** is covered by this README and [SETUP.md](SETUP.md), including
+hook registration and a short orchestrator brief.
 
 **Changing it** is covered by `MAINTAINING.md` in this repo. Read that first.
 It carries the traps, and every one of them cost something to find.

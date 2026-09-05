@@ -1,5 +1,11 @@
 # Maintaining codex-fleet
 
+These notes record the original deployment and its debugging history.
+For installation, use [SETUP.md](SETUP.md). Full filesystem access is not
+confined by `-C` or by a worktree; references below to working-directory
+isolation describe workflow separation, not a security boundary. The original
+private orchestration skill is not required; SETUP.md provides a generic brief.
+
 Read this before changing anything here. It is short, and the traps section
 below is the part that will save you: each item is something that shipped
 broken, or nearly did, in a single afternoon of building this.

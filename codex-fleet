@@ -1161,7 +1161,9 @@ def unanswered_blocking(name):
     return out
 
 
-def read_outbox(name, mark_read=True, include_unanswered_blocking=False):
+def read_outbox(
+    name, mark_read=True, include_unanswered_blocking=False, include_read=False
+):
     """Agent questions, oldest first. Used by `inbox` and the orchestrator's hook.
 
     A NON-blocking question is delivered once: it is informational and repeating
@@ -1194,7 +1196,11 @@ def read_outbox(name, mark_read=True, include_unanswered_blocking=False):
             rewritten.append(ln)
             continue
         blocking_unanswered = msg.get("blocking") and not msg.get("answered")
-        if not msg.get("read") or (include_unanswered_blocking and blocking_unanswered):
+        if (
+            include_read
+            or not msg.get("read")
+            or (include_unanswered_blocking and blocking_unanswered)
+        ):
             unread.append(msg)
             if mark_read and not msg.get("read"):
                 msg["read"] = True
@@ -1405,12 +1411,13 @@ def cmd_events(args):
                         # on every restart buried the live ones.
                         if first and (st != "running" or q.get("answered")):
                             continue
-                        if True:
-                            kind = "ASKING (blocking)" if q.get("blocking") else "asks"
-                            print(
-                                f"{kind} {name}: {q.get('text', '').strip()[:300]}  ->  codex-fleet tell {name} \"<answer>\"",
-                                flush=True,
-                            )
+                        kind = "ASKING (blocking)" if q.get("blocking") else "asks"
+                        blocking = str(bool(q.get("blocking"))).lower()
+                        print(
+                            f"{kind} {name} [blocking={blocking}]: {q.get('text', '')}"
+                            f"  ->  codex-fleet tell {name} \"<answer>\"",
+                            flush=True,
+                        )
 
                     bucket = 0
                     if st == "running":
@@ -1441,13 +1448,20 @@ def cmd_inbox(args):
     names = args.names or [n for n, _ in all_runs()]
     found = False
     for name in names:
-        msgs = read_outbox(name, mark_read=not args.peek, include_unanswered_blocking=True)
+        msgs = read_outbox(
+            name,
+            mark_read=not args.peek,
+            include_unanswered_blocking=True,
+            include_read=getattr(args, "all", False),
+        )
         for m in msgs:
             found = True
             if m.get("blocking"):
                 flag = paint("BLOCKING, unanswered", "red")
             else:
                 flag = "asks"
+            if getattr(args, "all", False) and m.get("read"):
+                flag += ", read"
             print(f"{paint(name, 'bold')} {flag} [{m.get('at','')}]")
             print(f"  {m.get('text','')}")
             if m.get("blocking"):
@@ -2868,6 +2882,7 @@ def main():
     ibp = sub.add_parser("inbox", help="show questions agents have raised")
     ibp.add_argument("names", nargs="*")
     ibp.add_argument("--peek", action="store_true", help="do not mark them read")
+    ibp.add_argument("--all", action="store_true", help="include questions already read")
     ibp.set_defaults(func=cmd_inbox)
 
     pp = sub.add_parser("prune", help="collapse old runs to their result, keeping them resumable")

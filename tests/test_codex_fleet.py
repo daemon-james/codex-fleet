@@ -552,6 +552,36 @@ time.sleep(30)
         self.assertEqual(cf.read_outbox("blocked", include_unanswered_blocking=True), [])
         self.assertEqual(cf.unanswered_blocking("blocked"), [])
 
+    def test_long_ask_reaches_events_and_inbox_all_after_delivery(self):
+        question = "a" * 299 + "\n" + "b" * 300
+        self._make_run("asker", pid=os.getpid())
+        with contextlib.redirect_stdout(io.StringIO()):
+            cf.cmd_ask(argparse.Namespace(name="asker", message=question, blocking=False))
+
+        # Delivery spends the ordinary inbox entry, but neither the stream nor
+        # the explicit history view may lose it.
+        self.assertEqual(cf.read_outbox("asker")[0]["text"], question)
+        events = io.StringIO()
+        with mock.patch.object(cf, "claim_events_lock", return_value=None), \
+             mock.patch.object(cf, "release_events_lock"), \
+             mock.patch.object(cf, "script_fingerprint", return_value=None), \
+             mock.patch.object(cf.time, "sleep", side_effect=RuntimeError("stop")), \
+             contextlib.redirect_stdout(events), contextlib.suppress(RuntimeError):
+            cf.cmd_events(argparse.Namespace(all=True))
+        self.assertIn(question, events.getvalue())
+        self.assertIn("blocking=false", events.getvalue())
+
+        history = io.StringIO()
+        with contextlib.redirect_stdout(history):
+            cf.cmd_inbox(argparse.Namespace(names=["asker"], peek=False, all=True))
+        self.assertIn(question, history.getvalue())
+        self.assertIn("read", history.getvalue())
+
+        ordinary = io.StringIO()
+        with contextlib.redirect_stdout(ordinary):
+            cf.cmd_inbox(argparse.Namespace(names=["asker"], peek=False, all=False))
+        self.assertEqual(ordinary.getvalue(), "nothing raised\n")
+
     def test_the_hook_repeats_a_blocking_question_on_every_fire(self):
         # The hook's drain is a separate implementation from read_outbox, and it
         # is the one that lost a question for twenty minutes.

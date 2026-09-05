@@ -277,6 +277,28 @@ def usage_of(events, meta=None):
     return total
 
 
+def mcp_health(events, meta=None):
+    """Successful and failed MCP calls in one turn."""
+    ok = failed = 0
+    for ev in events:
+        item = ev.get("item") or {}
+        if ev.get("type") != "item.completed" or item.get("type") != "mcp_tool_call":
+            continue
+        if item.get("status") == "failed" or item.get("error") is not None:
+            failed += 1
+        else:
+            ok += 1
+    if meta and meta.get("pruned_at") and not events:
+        saved = meta.get("final_mcp") or {}
+        return saved.get("ok", 0), saved.get("failed", 0)
+    return ok, failed
+
+
+def mcp_text(events, meta=None):
+    ok, failed = mcp_health(events, meta)
+    return f"mcp={ok}/{failed}"
+
+
 
 def mtime(path, meta=None):
     """Last activity as a sortable number. Missing files sort last, not first.
@@ -743,7 +765,7 @@ def cmd_list(args):
     if not runs:
         print("no runs")
         return
-    header = f"{'NAME':<24} {'STATUS':<9} {'ROLE':<17} {'MODEL':<15} {'EFFORT':<7} {'TURNS':<6} {'TOK(out)':<9} {'AGE':<5} LAST"
+    header = f"{'NAME':<24} {'STATUS':<9} {'ROLE':<17} {'MODEL':<15} {'EFFORT':<7} {'TURNS':<6} {'TOK(out)':<9} {'MCP':<9} {'AGE':<5} LAST"
     print(paint(header, "bold"))
     for name, meta in runs:
         st = status_of(name, meta)
@@ -752,8 +774,8 @@ def cmd_list(args):
         if unanswered_blocking(name):
             st = "ASKING"
         events = all_events(name, meta)
-        usage = usage_of(events, meta)
         latest = run_dir(name) / f"turn-{meta.get('turns', 1)}.jsonl"
+        latest_events = read_events(latest)
         msg = last_message(events, name).replace("\n", " ")[:60]
         colour = {"running": "green", "failed": "red", "idle": "cyan", "ASKING": "red"}.get(
             st, "dim"
@@ -763,7 +785,7 @@ def cmd_list(args):
         print(
             f"{name:<24} {paint(f'{st:<9}', colour)} {role:<17} {meta['model']:<15} {meta['effort']:<7} "
             f"{meta.get('turns', 0):<6} {render_output_tokens(events, meta):<9} "
-            f"{age(latest, meta):<5} {msg}{foreign}"
+            f"{mcp_text(latest_events, meta):<9} {age(latest, meta):<5} {msg}{foreign}"
         )
 
 
@@ -867,6 +889,8 @@ def cmd_result(args):
         if err_path.exists() and err_path.stat().st_size:
             sys.stderr.write(err_path.read_text()[:2000])
         die(f"{args.name}: no agent message in turn {meta.get('turns')} (status {st})", 2)
+    latest = read_events(run_dir(args.name) / f"turn-{meta.get('turns', 1)}.jsonl")
+    print(mcp_text(latest, meta))
     print(text)
     warn_if_unwatched(exclude=args.name)
 
@@ -1391,8 +1415,13 @@ def cmd_events(args):
                         print(f"started {name} ({role})", flush=True)
                     elif prev and prev["status"] == "running" and st != "running":
                         verb = {"idle": "finished", "failed": "FAILED", "stopped": "stopped without completing"}.get(st, st)
-                        msg = last_message(read_events(latest), name).replace("\n", " ")[:160]
-                        print(f"{verb} {name} ({role}): {msg}  ->  codex-fleet result {name}", flush=True)
+                        latest_events = read_events(latest)
+                        msg = last_message(latest_events, name).replace("\n", " ")[:160]
+                        print(
+                            f"{verb} {name} ({role}) {mcp_text(latest_events, meta)}: "
+                            f"{msg}  ->  codex-fleet result {name}",
+                            flush=True,
+                        )
 
                     # Every question, blocking or not. A non-blocking ask is still
                     # a question the agent wants answered; the status hook marks it
@@ -1551,6 +1580,9 @@ def cmd_prune(args):
         (d / "result.txt").write_text(last_message(events) or "", encoding="utf-8")
         meta["final_status"] = status_of(name, meta)
         meta["final_usage"] = usage_of(events)
+        latest_events = read_events(d / f"turn-{meta.get('turns', 1)}.jsonl")
+        ok, failed = mcp_health(latest_events)
+        meta["final_mcp"] = {"ok": ok, "failed": failed}
         meta["last_activity"] = last
         meta["pruned_at"] = now()
         save_meta(name, meta)

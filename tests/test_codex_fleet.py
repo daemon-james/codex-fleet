@@ -405,6 +405,8 @@ time.sleep(30)
             meta["final_usage"],
             {"input_tokens": 11, "cached_input_tokens": 22, "output_tokens": 33},
         )
+        self.assertEqual(meta["final_mcp"], {"ok": 0, "failed": 0})
+        self.assertEqual(cf.mcp_text([], meta), "mcp=0/0")
         self.assertAlmostEqual(meta["last_activity"], last_activity, places=3)
         datetime.fromisoformat(meta["pruned_at"])
 
@@ -520,6 +522,48 @@ time.sleep(30)
             cf.render_output_tokens([reasoning(), reasoning()]),
             f"~{2 * cf.TOKENS_PER_REASONING_ITEM}",
         )
+
+    def test_mcp_health_reaches_list_result_and_finished_event(self):
+        calls = [
+            {"type": "item.completed", "item": {"type": "mcp_tool_call", "status": status}}
+            for status in ("completed", "completed", "failed")
+        ]
+        events = calls + [
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "done"}},
+            {"type": "turn.completed", "usage": {}},
+        ]
+        _run, meta = self._make_run("mcp-run", pid=os.getpid(), turns=[events])
+        self.assertEqual(cf.mcp_text([]), "mcp=0/0")
+
+        listed = io.StringIO()
+        with contextlib.redirect_stdout(listed):
+            cf.cmd_list(argparse.Namespace())
+        self.assertIn("mcp=2/1", listed.getvalue())
+
+        result = io.StringIO()
+        with contextlib.redirect_stdout(result):
+            cf.cmd_result(argparse.Namespace(name="mcp-run", all=False))
+        self.assertEqual(result.getvalue().splitlines()[0], "mcp=2/1")
+
+        sleeps = 0
+
+        def finish_then_stop(_seconds):
+            nonlocal sleeps
+            sleeps += 1
+            if sleeps == 1:
+                meta["pid"] = None
+                self._write_meta("mcp-run", meta)
+                return
+            raise RuntimeError("stop")
+
+        stream = io.StringIO()
+        with mock.patch.object(cf, "claim_events_lock", return_value=None), \
+             mock.patch.object(cf, "release_events_lock"), \
+             mock.patch.object(cf, "script_fingerprint", return_value=None), \
+             mock.patch.object(cf.time, "sleep", side_effect=finish_then_stop), \
+             contextlib.redirect_stdout(stream), contextlib.suppress(RuntimeError):
+            cf.cmd_events(argparse.Namespace(all=True))
+        self.assertIn("finished mcp-run (engineer) mcp=2/1", stream.getvalue())
 
     def _write_outbox(self, name, messages):
         run = self.runs / name

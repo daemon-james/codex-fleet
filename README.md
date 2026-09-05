@@ -16,7 +16,7 @@ codex-fleet tell scout "actually, start from the handler"   # reaches it mid-tur
 codex-fleet result scout
 ```
 
-Run `codex-fleet serve --daemon` for a detached dashboard, inspect it with `serve --status`, and stop it with `serve --stop`; `list` always reports its address first, ask events retain the full question and blocking flag, and `inbox --all` includes read questions.
+Run `codex-fleet serve --daemon` for a detached dashboard, inspect it with `serve --status`, and stop it with `serve --stop`; `list` always reports its address first, ask events retain the full question and blocking flag, `inbox --all` includes read questions, and latest-turn MCP success/failure totals appear in `list`, `result`, and finished events.
 
 ## Roles and effort
 

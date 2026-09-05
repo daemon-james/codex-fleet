@@ -433,7 +433,7 @@ def build_cmd(meta, prompt, resume_id=None):
     agent in one could commit; `net.listen` could not bind, so agents reported
     sandbox refusals as test failures; and every MCP call died with "MCP tool
     call requires approval, but approval policy is never", so no agent could
-    reach Mnemonik. Three lost turns to it and the orchestrator lost an
+    use their MCP tools. Three lost turns to it and the orchestrator lost an
     afternoon diagnosing walls it had built itself.
 
     Old runs may carry another `sandbox` value in meta.json. It is ignored.
@@ -534,18 +534,6 @@ def launch(name, meta, prompt, resume_id=None):
     # it the hook stays silent, which is also what every interactive Codex
     # session on this machine wants.
     child_env = dict(os.environ, CODEX_FLEET_RUN=name)
-    # A worktree cwd resolves to no project: Mnemonik's server is remote and
-    # cannot read the .mnemonik.json sitting right there in the worktree, so
-    # every agent's first recall fails and it burns a turn working out that it
-    # must retry with an explicit id. Read the id here, where the file IS
-    # readable, and hand it over.
-    pid_file = Path(meta.get("worktree_root") or meta["cwd"]) / ".mnemonik.json"
-    try:
-        ident = json.loads(pid_file.read_text())
-        if isinstance(ident.get("projectId"), str):
-            child_env["MNEMONIK_PROJECT_ID"] = ident["projectId"]
-    except (OSError, ValueError, KeyError):
-        pass
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.DEVNULL,

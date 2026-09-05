@@ -10,14 +10,9 @@ Read this before changing anything here. It is short, and the traps section
 below is the part that will save you: each item is something that shipped
 broken, or nearly did, in a single afternoon of building this.
 
-## What this is, and is not
+## What this is
 
-A development tool for running Codex agents in the background. **It is not part
-of Mnemonik.** Do not commit any of it into the Mnemonik repository, do not put
-its docs in Mnemonik's `docs/`, and do not add Mnemonik as a dependency. The
-only connection is that agent briefs written for Mnemonik work include a
-paragraph authorizing Mnemonik's MCP tools, and that paragraph is a template in
-the skill, not code here.
+A standalone development tool for running Codex agents in the background.
 
 ## Where the pieces live
 
@@ -36,7 +31,7 @@ Registration is separate from installation and `install.sh` deliberately does
 not do it, because both hosts gate it:
 
 - **Codex** reads `~/.codex/hooks.json`. The inbox hook is a second group under
-  `PostToolUse`, appended beside the Mnemonik hook rather than replacing it.
+  `PostToolUse`, appended alongside any existing hooks.
   Codex asks the owner to trust a new hook once, recording a `trusted_hash` in
   `~/.codex/config.toml` under a key like
   `hooks.state."~/.codex/hooks.json:post_tool_use:1:0"`. **Until they approve
@@ -132,15 +127,6 @@ orchestrator lost an afternoon diagnosing walls it had built.
 These are frontier models on the user's own hardware. Confining the working
 directory is reasonable. Anything past that is trapping them, and the trap costs
 more than it ever prevented.
-
-**Codex's own risk layer blocks sending file contents to an MCP server.** It
-rejected `mnemonik.file_context({filePaths})` with "This action was rejected due
-to unacceptable risk... would transmit potentially sensitive internal
-source-file contents". The agent then worked blind for the rest of its turn and
-mentioned it once. `memory_search`, `session_bootstrap` and `checkpoint` pass;
-only file CONTENTS trigger it. The fix is an explicit authorization paragraph in
-the brief, bounded to the repo so it stays truthful. The template is in the
-skill.
 
 **`say` cannot reach a running agent, and never will.** `codex exec` reads stdin
 only for the initial prompt, runs the turn to completion, and exits. There is no
@@ -361,20 +347,3 @@ because `codex exec resume` accepts neither `-C` nor `--add-dir`.
 
 An ordinary checkout returns `None` here: its `.git` is a directory already
 inside `-C`, and widening the sandbox on a guess would be worse than the bug.
-
-**Give agents the real Mnemonik call shape, not Code Mode syntax.** Writing
-`mnemonik.checkpoint({...})` in a brief is wrong. That syntax only works INSIDE
-the tool, so an agent runs it as raw JavaScript and gets
-`TypeError: Cannot read properties of undefined`. Two agents on 2026-08-22 then
-reported that Mnemonik was unreachable and that the connector needed approval,
-and the orchestrator spent a chunk of the afternoon chasing a block that did not
-exist. Probes from both a worktree and the main repo showed
-`mnemonik__memory_discover`, `mnemonik__memory_tools` and
-`mnemonik__session_bootstrap` all visible and the call succeeding.
-
-The real call is the MCP tool on server `metamcp`, named
-`mnemonik__memory_tools`, with one `code` argument holding an async arrow
-function that returns a `mnemonik.*` call.
-
-An agent reporting a capability as absent is reporting what it tried, not what
-exists. Probe before believing it.

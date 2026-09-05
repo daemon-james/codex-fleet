@@ -7,8 +7,7 @@ spawn and finish the agent is blind unless it remembers to poll. It does not
 always remember. That is how two finished reviewers sat unread for twenty
 minutes on 2026-08-21.
 
-This closes the gap the same way Mnemonik closes it for memory: the host pushes,
-the agent does not have to ask.
+The host pushes status changes into the orchestrator’s context.
 
 NO-NOISE CONTRACT. Silence is the default. Output happens only on a transition:
 a run that was running has stopped, a run has newly appeared, or a running agent

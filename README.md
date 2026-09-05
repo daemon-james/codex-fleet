@@ -53,7 +53,7 @@ codex-fleet say scout "Explain the main entry point." # follow up after it finis
 This first release publishes the existing implementation. Linux-specific
 process inspection and socket locking need porting before macOS or native
 Windows support. Model access and hook compatibility depend on your Codex
-installation. Mnemonik is optional; Fleet does not require its service.
+installation.
 
 Run `codex-fleet serve --daemon` for a detached dashboard, inspect it with `serve --status`, and stop it with `serve --stop`; `list` always reports its address first, ask events retain the full question and blocking flag, `inbox --all` includes read questions, latest-turn MCP success/failure totals appear in `list`, `result`, and finished events, and dashboard polling reads only newly appended turn-log bytes.
 

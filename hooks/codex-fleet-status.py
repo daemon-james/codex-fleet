@@ -322,6 +322,7 @@ def main():
     except (json.JSONDecodeError, OSError):
         payload = {}
     owner = payload.get("session_id") or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    event = payload.get("hook_event_name") or os.environ.get("CLAUDE_HOOK_EVENT_NAME") or "PostToolUse"
     runs = survey(owner=owner)
     if not runs:
         return
@@ -332,6 +333,15 @@ def main():
         seen = {}
 
     lines, questions = [], []
+    monitor_reminder = None
+    session = owner or "<unknown>"
+    reminded = set(seen.get("_monitor_reminded") or [])
+    if event == "UserPromptSubmit" and session not in reminded and not events_monitor_armed():
+        monitor_reminder = (
+            "codex-fleet: no events monitor armed; arm with "
+            "Monitor({command:'codex-fleet events', persistent:true})"
+        )
+        reminded.add(session)
     for name, run in runs.items():
         for msg in drain_outbox(name):
             mark = "BLOCKING" if msg.get("blocking") else "asks"
@@ -387,15 +397,17 @@ def main():
     persisted = {k: {"status": v["status"], "stall": v.get("stall", 0)} for k, v in runs.items()}
     if seen.get("_unwatched_at"):
         persisted["_unwatched_at"] = seen["_unwatched_at"]
+    if reminded:
+        persisted["_monitor_reminded"] = sorted(reminded)
     try:
         STATE.parent.mkdir(parents=True, exist_ok=True)
         STATE.write_text(json.dumps(persisted))
     except OSError:
         pass
 
-    if not lines and not questions and not nag:
+    if not lines and not questions and not nag and not monitor_reminder:
         return
-    body = "Codex fleet update (pushed by a hook, you did not ask for it):"
+    body = monitor_reminder or "Codex fleet update (pushed by a hook, you did not ask for it):"
     if questions:
         body += (
             "\n\nAN AGENT IS ASKING YOU SOMETHING. It is still working and will"
@@ -406,12 +418,12 @@ def main():
         body += "\n\n- " + "\n- ".join(nag)
     if lines:
         body += "\n\n- " + "\n- ".join(lines)
-    if running:
-        body += f"\nStill running: {', '.join(running)}."
-    else:
-        body += "\nNo fleet agents are running now."
+    if lines or questions or nag:
+        if running:
+            body += f"\nStill running: {', '.join(running)}."
+        else:
+            body += "\nNo fleet agents are running now."
 
-    event = os.environ.get("CLAUDE_HOOK_EVENT_NAME") or "PostToolUse"
     print(
         json.dumps(
             {

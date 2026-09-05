@@ -734,6 +734,11 @@ def cmd_spawn(args):
 
 
 def cmd_list(args):
+    dashboard = dashboard_info()
+    print(
+        f"dashboard: http://{dashboard['host']}:{dashboard['port']}"
+        if dashboard else "dashboard: not running"
+    )
     runs = all_runs()
     if not runs:
         print("no runs")
@@ -2584,10 +2589,102 @@ draw();drawAllowance();setInterval(draw,2000);setInterval(poll,1200);setInterval
 """
 
 
+def _read_serve_pid():
+    try:
+        info = json.loads((ROOT / "serve.pid").read_text(encoding="utf-8"))
+        return {
+            "pid": int(info["pid"]),
+            "host": str(info["host"]),
+            "port": int(info["port"]),
+        }
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return None
+
+
+def dashboard_info():
+    """The recorded server is useful only while its process and port are live."""
+    info = _read_serve_pid()
+    if not info or not alive(info["pid"]):
+        return None
+    host = info["host"]
+    probe = "127.0.0.1" if host == "0.0.0.0" else "::1" if host == "::" else host
+    try:
+        with socket.create_connection((probe, info["port"]), timeout=0.2):
+            return info
+    except OSError:
+        return None
+
+
+def _remove_serve_pid(pid=None):
+    info = _read_serve_pid()
+    if pid is not None and info and info["pid"] != pid:
+        return
+    try:
+        (ROOT / "serve.pid").unlink()
+    except OSError:
+        pass
+
+
+def _daemonize():
+    """Double-fork and leave the caller only after the dashboard is reachable."""
+    ROOT.mkdir(parents=True, exist_ok=True)
+    child = os.fork()
+    if child:
+        os.waitpid(child, 0)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            info = dashboard_info()
+            if info:
+                print(f"dashboard started: pid={info['pid']} port={info['port']}")
+                return True
+            time.sleep(0.05)
+        die(f"dashboard did not start; see {ROOT / 'serve.log'}")
+    os.setsid()
+    if os.fork():
+        os._exit(0)
+    null = os.open(os.devnull, os.O_RDONLY)
+    log = os.open(ROOT / "serve.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    os.dup2(null, 0)
+    os.dup2(log, 1)
+    os.dup2(log, 2)
+    os.close(null)
+    os.close(log)
+    return False
+
+
 def cmd_serve(args):
     import base64
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from urllib.parse import urlparse, parse_qs
+
+    if getattr(args, "status", False):
+        info = dashboard_info()
+        if info:
+            print(f"dashboard: http://{info['host']}:{info['port']} pid={info['pid']} port={info['port']}")
+        else:
+            print("dashboard: not running")
+        return
+    if getattr(args, "stop", False):
+        info = dashboard_info()
+        if not info:
+            _remove_serve_pid()
+            print("dashboard: not running")
+            return
+        try:
+            os.kill(info["pid"], signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        _remove_serve_pid(info["pid"])
+        print(f"dashboard stopped: pid={info['pid']}")
+        return
+    if getattr(args, "daemon", False):
+        info = dashboard_info()
+        if info:
+            print(f"dashboard already running: pid={info['pid']} port={info['port']}")
+            return
+        if _daemonize():
+            return
+
     allowance = SubscriptionAllowance()
 
     class Handler(BaseHTTPRequestHandler):
@@ -2654,8 +2751,16 @@ def cmd_serve(args):
             file=sys.stderr,
         )
         sys.exit(0)
+    ROOT.mkdir(parents=True, exist_ok=True)
+    (ROOT / "serve.pid").write_text(
+        json.dumps({"pid": os.getpid(), "host": args.host, "port": args.port}),
+        encoding="utf-8",
+    )
     print(f"codex-fleet dashboard on http://{lan_ip()}:{args.port}  (ctrl-c to stop)")
-    srv.serve_forever()
+    try:
+        srv.serve_forever()
+    finally:
+        _remove_serve_pid(os.getpid())
 
 
 def lan_ip():
@@ -2796,6 +2901,10 @@ def main():
     vp = sub.add_parser("serve", help="live web dashboard for every run")
     vp.add_argument("--port", type=int, default=8787)
     vp.add_argument("--host", default="0.0.0.0", help="bind address; LAN-reachable by default")
+    mode = vp.add_mutually_exclusive_group()
+    mode.add_argument("--daemon", action="store_true", help="detach and log under ~/.codex-fleet")
+    mode.add_argument("--status", action="store_true", help="report the recorded dashboard")
+    mode.add_argument("--stop", action="store_true", help="stop the recorded dashboard")
     vp.set_defaults(func=cmd_serve)
 
     args = p.parse_args()

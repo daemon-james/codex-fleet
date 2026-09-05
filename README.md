@@ -16,6 +16,8 @@ codex-fleet tell scout "actually, start from the handler"   # reaches it mid-tur
 codex-fleet result scout
 ```
 
+Run `codex-fleet serve --daemon` for a detached dashboard, inspect it with `serve --status`, and stop it with `serve --stop`; `list` always reports its address first.
+
 ## Roles and effort
 
 The role selects the model. High is the default effort for every role.

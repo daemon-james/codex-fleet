@@ -6,6 +6,7 @@ import io
 import json
 import os
 import stat
+import socket
 import subprocess
 import sys
 import tempfile
@@ -781,6 +782,66 @@ time.sleep(30)
             with contextlib.redirect_stdout(out):
                 cf.cmd_list(argparse.Namespace())
         self.assertIn("ASKING", out.getvalue())
+
+    def test_daemon_status_list_and_stop_use_the_pidfile(self):
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        env = {**os.environ, "CODEX_FLEET_HOME": str(self.fleet_home)}
+        command = [sys.executable, str(ROOT / "codex-fleet"), "serve"]
+        self.addCleanup(lambda: subprocess.run(
+            [*command, "--stop"], env=env, capture_output=True, timeout=3
+        ))
+
+        started = subprocess.run(
+            [*command, "--daemon", "--host", "127.0.0.1", "--port", str(port)],
+            env=env, text=True, capture_output=True, timeout=8,
+        )
+        self.assertEqual(started.returncode, 0, started.stderr)
+        self.assertTrue((self.fleet_home / "serve.pid").exists())
+        status = subprocess.run(
+            [*command, "--status"], env=env, text=True, capture_output=True, timeout=3
+        )
+        self.assertRegex(status.stdout, rf"pid=\d+ port={port}")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cf.cmd_list(argparse.Namespace())
+        self.assertTrue(output.getvalue().startswith(f"dashboard: http://127.0.0.1:{port}\n"))
+
+        stopped = subprocess.run(
+            [*command, "--stop"], env=env, text=True, capture_output=True, timeout=3
+        )
+        self.assertIn("dashboard stopped", stopped.stdout)
+        self.assertFalse((self.fleet_home / "serve.pid").exists())
+
+    def test_status_hook_reminds_once_per_session_only_without_an_events_monitor(self):
+        self._make_run("done", turns=[[{"type": "turn.completed", "usage": {}}]])
+        prompt = json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": "one"})
+        expected = (
+            "codex-fleet: no events monitor armed; arm with "
+            "Monitor({command:'codex-fleet events', persistent:true})"
+        )
+        state = self.fleet_home / ".hook-seen.json"
+
+        def fire(payload, armed):
+            output = io.StringIO()
+            with mock.patch.object(hook, "RUNS", self.runs), \
+                 mock.patch.object(hook, "STATE", state), \
+                 mock.patch.object(hook, "events_monitor_armed", return_value=armed), \
+                 mock.patch.object(sys, "stdin", io.StringIO(payload)), \
+                 contextlib.redirect_stdout(output):
+                hook.main()
+            return output.getvalue()
+
+        first = fire(prompt, False)
+        second = fire(prompt, False)
+        self.assertEqual(
+            json.loads(first)["hookSpecificOutput"]["additionalContext"], expected
+        )
+        self.assertEqual(second, "")
+
+        armed_prompt = json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": "two"})
+        self.assertEqual(fire(armed_prompt, True), "")
 
     def test_activity_reads_the_log_before_pruning_and_last_activity_afterward(self):
         run, meta, last_activity = self._make_prunable_run()

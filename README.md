@@ -7,6 +7,25 @@ mid-turn, and be interrupted by.
 let Claude Code orchestrate them. Fleet uses Python's standard library; there
 is no Python dependency installation or frontend build step.
 
+## Install with Claude Code
+
+Paste this into Claude Code on your Linux machine:
+
+```text
+Install codex-fleet from https://github.com/daemon-james/codex-fleet.
+Read its README.md and follow the agent installation procedure in SETUP.md.
+Install the bundled Claude skill, merge the hooks into my existing settings,
+and verify the setup with one small agent run. Preserve my existing settings
+and files. Use a localhost dashboard. I understand Fleet runs Codex agents
+with full filesystem access. Do the setup; ask me only for required login,
+hook trust, or a decision you cannot resolve from my machine.
+```
+
+Claude handles the clone, installer, skill, hook configuration and checks.
+You handle any interactive login or trust prompt. The bundled
+[skill](skills/codex-fleet/SKILL.md) teaches Claude how to choose roles, supervise
+agents, steer them, use worktrees, and verify their results.
+
 ## Requirements and installation
 
 Release checks ran on Linux with Python 3.12.3 and Codex CLI 0.153.4.
@@ -91,13 +110,16 @@ remaining and refreshes once a minute.
 | `tools/embed-page.py` | puts `dashboard.html` into the CLI and verifies it survived |
 | `hooks/codex-fleet-inbox.py` | Codex `PostToolUse`. Delivers `tell` messages into a running agent |
 | `hooks/codex-fleet-status.py` | Claude `PostToolUse`. Surfaces agent state and `ask` questions to the orchestrator |
-| `install.sh` | symlinks all three into the two host directories. Idempotent |
+| `hooks/codex-fleet-stop.py` | Claude `Stop`. Checks for unobserved runs and unread results |
+| `skills/codex-fleet/SKILL.md` | Claude Code orchestration skill, installed by `install.sh` |
+| `install.sh` | symlinks the CLI, three hooks and skill into place. Idempotent |
 | `tests/` | `python3 -m unittest discover -s tests` |
 
 ## Two guides, two jobs
 
 **Using it** is covered by this README and [SETUP.md](SETUP.md), including
-hook registration and a short orchestrator brief.
+the agent installation procedure and hook registration. The bundled
+[skill](skills/codex-fleet/SKILL.md) covers orchestration.
 
 **Changing it** is covered by `MAINTAINING.md` in this repo. Read that first.
 It carries the traps, and every one of them cost something to find.

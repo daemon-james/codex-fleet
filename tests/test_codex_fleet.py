@@ -1881,6 +1881,29 @@ class CronInstallTests(unittest.TestCase):
         self.assertTrue((self.home / ".codex-fleet").is_dir(),
                         "the directory the cron line redirects into is missing")
 
+    def test_skill_install_preserves_existing_file_and_is_repeatable(self):
+        skill = self.home / ".claude/skills/codex-fleet/SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("local custom skill")
+        result = self._install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(skill.is_symlink())
+        self.assertEqual(skill.resolve(), ROOT / "skills/codex-fleet/SKILL.md")
+        backups = list(skill.parent.glob("SKILL.md.replaced-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(), "local custom skill")
+        self.assertEqual(self._install().returncode, 0)
+        self.assertEqual(list(skill.parent.glob("SKILL.md.replaced-*")), backups)
+        self.assertEqual(self._install("--check").returncode, 0)
+        skill.unlink()
+        self.assertNotEqual(self._install("--check").returncode, 0)
+
+    def test_check_on_fresh_home_creates_nothing(self):
+        result = self._install("--check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(list(self.home.iterdir()), [])
+        self.assertFalse(self.table.exists())
+
     def test_existing_crontab_entries_survive(self):
         self.table.write_text("MAILTO=me\n0 3 * * * /usr/bin/payroll\n")
 

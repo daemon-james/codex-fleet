@@ -3,8 +3,8 @@
 These notes record the original deployment and its debugging history.
 For installation, use [SETUP.md](SETUP.md). Full filesystem access is not
 confined by `-C` or by a worktree; references below to working-directory
-isolation describe workflow separation, not a security boundary. The original
-private orchestration skill is not required; SETUP.md provides a generic brief.
+isolation describe workflow separation, not a security boundary. The bundled
+`skills/codex-fleet/SKILL.md` is the public orchestration guide.
 
 Read this before changing anything here. It is short, and the traps section
 below is the part that will save you: each item is something that shipped
@@ -16,13 +16,15 @@ A standalone development tool for running Codex agents in the background.
 
 ## Where the pieces live
 
-Three files, three destinations, all symlinked by `install.sh`:
+The CLI, hooks and skill are symlinked by `install.sh`:
 
 | Repo file | Symlinked to | Read by |
 | --- | --- | --- |
 | `codex-fleet` | `~/.local/bin/codex-fleet` | you, and agents calling `codex-fleet ask` |
 | `hooks/codex-fleet-inbox.py` | `~/.codex/hooks/codex-fleet-inbox.py` | Codex, on `PostToolUse` |
 | `hooks/codex-fleet-status.py` | `~/.claude/hooks/codex-fleet-status.py` | Claude Code, on `PostToolUse` and `UserPromptSubmit` |
+| `hooks/codex-fleet-stop.py` | `~/.claude/hooks/codex-fleet-stop.py` | Claude Code, on `Stop` |
+| `skills/codex-fleet/SKILL.md` | `~/.claude/skills/codex-fleet/SKILL.md` | Claude Code skill discovery |
 
 Symlinks, not copies, so an edit here is live immediately and there is no deploy
 step to forget.
@@ -292,8 +294,9 @@ turns: 326 to 600 per item, median 480, and both models agreed (sol 484, terra
 ```bash
 python3 - <<'PY'
 import json, glob, statistics
+from pathlib import Path
 rows = []
-for p in glob.glob('/home/dev/.codex-fleet/runs/*/turn-*.jsonl'):
+for p in glob.glob(str(Path.home() / '.codex-fleet/runs/*/turn-*.jsonl')):
     items, exact = 0, None
     for line in open(p, errors='ignore'):
         try: ev = json.loads(line)

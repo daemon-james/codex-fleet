@@ -16,7 +16,32 @@ codex-fleet tell scout "actually, start from the handler"   # reaches it mid-tur
 codex-fleet result scout
 ```
 
-## What is here
+## Roles and effort
+
+The role selects the model. High is the default effort for every role.
+
+| Role | Model | Available efforts |
+| --- | --- | --- |
+| Engineer (`engineer`) | Sol (`gpt-5.6-sol`) | High, Extra High |
+| Reviewer (`reviewer`) | Terra (`gpt-5.6-terra`) | High, Extra High |
+| Advanced Engineer (`advanced-engineer`) | Astra (`gpt-6-astra`) | Medium, High, Extra High |
+
+```bash
+codex-fleet spawn "<engineering task>" -r advanced-engineer -C /path/to/repo
+codex-fleet spawn "<harder engineering task>" -r advanced-engineer -e xhigh -C /path/to/repo
+```
+
+Use `-e medium` for lighter Astra work. `say` keeps a run's model and effort
+unless you supply `-e`; the new effort must be available to that run's role.
+
+## Files
+
+The dashboard uses a full-screen run list and a separate activity view on
+phones. Tap a run to read its log, **Runs** to return, and **Details & filters**
+to expand metadata and event controls. Desktop keeps the side-by-side layout.
+Browser tabs and iPhone Home Screen bookmarks use the fleet icon.
+The bar beneath the fleet heading shows your weekly subscription allowance
+remaining and refreshes once a minute.
 
 | Path | What it is |
 | --- | --- |

@@ -57,6 +57,175 @@ class CodexFleetTests(unittest.TestCase):
         cf.RUNS = self._old_runs
         self._temp.cleanup()
 
+    def test_role_selection_reaches_codex_with_requested_or_default_effort(self):
+        cases = [
+            ([], "engineer", "gpt-5.6-sol", "high"),
+            (["-r", "reviewer"], "reviewer", "gpt-5.6-terra", "high"),
+            (["-r", "advanced-engineer"], "advanced-engineer", "gpt-6-astra", "high"),
+            (["-r", "advanced-engineer", "-e", "medium"], "advanced-engineer", "gpt-6-astra", "medium"),
+            (["-r", "advanced-engineer", "-e", "xhigh"], "advanced-engineer", "gpt-6-astra", "xhigh"),
+        ]
+        for i, (flags, role, model, effort) in enumerate(cases):
+            with self.subTest(flags=flags):
+                name = f"selection-{i}"
+                def launch(run_name, meta, prompt):
+                    meta["pid"] = 999999
+                    cf.save_meta(run_name, meta)
+                    return 999999, self.runs / run_name / "turn-1.jsonl"
+                argv = ["codex-fleet", "spawn", "task", "-n", name, "-C", str(self.temp_path), "--no-prune", *flags]
+                with mock.patch.object(sys, "argv", argv), \
+                     mock.patch.object(cf.shutil, "which", return_value="codex"), \
+                     mock.patch.object(cf, "launch", side_effect=launch), \
+                     mock.patch.object(cf, "await_thread_id", return_value="thread-test"), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    cf.main()
+                meta = cf.load_meta(name)
+                self.assertEqual((meta["role"], meta["model"], meta["effort"]), (role, model, effort))
+                for resume_id in (None, "thread-test"):
+                    cmd = cf.build_cmd(meta, "task", resume_id=resume_id)
+                    self.assertEqual(cmd[cmd.index("-m") + 1], model)
+                    self.assertIn(f"model_reasoning_effort={effort}", cmd)
+
+    def test_invalid_role_efforts_do_not_replace_an_existing_run(self):
+        run, _ = self._make_run("keep")
+        before = (run / "meta.json").read_bytes()
+        for role, effort in [("engineer", "medium"), ("reviewer", "medium"),
+                             ("advanced-engineer", "low"), ("advanced-engineer", "max"),
+                             ("advanced-engineer", "ultra")]:
+            with self.subTest(role=role, effort=effort), \
+                 mock.patch.object(sys, "argv", ["codex-fleet", "spawn", "task", "-n", "keep", "--force", "-r", role, "-e", effort]), \
+                 mock.patch.object(cf, "launch") as launch, \
+                 contextlib.redirect_stderr(io.StringIO()), \
+                 self.assertRaises(SystemExit) as raised:
+                cf.main()
+            self.assertEqual(raised.exception.code, 2)
+            launch.assert_not_called()
+            self.assertEqual((run / "meta.json").read_bytes(), before)
+
+    def test_astra_resume_keeps_or_changes_effort(self):
+        for effort in (None, "medium", "high", "xhigh"):
+            with self.subTest(effort=effort):
+                name = f"resume-{effort}"
+                self._make_run(name, meta_updates={"role": "advanced-engineer", "model": "gpt-6-astra", "effort": "xhigh"})
+                flags = ["-e", effort] if effort else []
+                with mock.patch.object(sys, "argv", ["codex-fleet", "say", name, "continue", *flags]), \
+                     mock.patch.object(cf, "refresh_worktree", return_value=None), \
+                     mock.patch.object(cf, "launch", return_value=(999999, None)) as launch, \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    cf.main()
+                meta = launch.call_args.args[1]
+                self.assertEqual(meta["model"], "gpt-6-astra")
+                self.assertEqual(meta["effort"], effort or "xhigh")
+                self.assertEqual(launch.call_args.kwargs["resume_id"], f"thread-{name}")
+
+    def test_resume_rejects_effort_outside_saved_role(self):
+        run, _ = self._make_run("engineer")
+        before = (run / "meta.json").read_bytes()
+        with mock.patch.object(sys, "argv", ["codex-fleet", "say", "engineer", "continue", "-e", "medium"]), \
+             mock.patch.object(cf, "launch") as launch, \
+             mock.patch.object(cf, "refresh_worktree") as refresh, \
+             contextlib.redirect_stderr(io.StringIO()), \
+             self.assertRaises(SystemExit) as raised:
+            cf.main()
+        self.assertEqual(raised.exception.code, 2)
+        launch.assert_not_called()
+        refresh.assert_not_called()
+        self.assertEqual((run / "meta.json").read_bytes(), before)
+
+    def test_models_reports_each_roles_efforts_and_default(self):
+        catalog = self.home / ".codex" / "models_cache.json"
+        catalog.parent.mkdir()
+        catalog.write_text(json.dumps({"models": [
+            {"slug": model, "supported_reasoning_levels": [{"effort": e} for e in cf.EFFORTS[role]]}
+            for role, model in cf.ROLES.items()
+        ]}))
+        output = io.StringIO()
+        with mock.patch.object(cf.Path, "home", return_value=self.home), contextlib.redirect_stdout(output):
+            cf.cmd_models(argparse.Namespace())
+        lines = output.getvalue().splitlines()
+        self.assertEqual(len(lines), 3)
+        astra = next(line for line in lines if line.startswith("advanced-engineer"))
+        self.assertIn("gpt-6-astra", astra)
+        self.assertIn("efforts=medium,high,xhigh", astra)
+        for line in lines:
+            self.assertIn("default=high", line)
+            self.assertTrue(line.endswith("ok"))
+
+    def test_weekly_allowance_uses_duration_and_main_bucket(self):
+        weekly = {"usedPercent": 56, "windowDurationMins": 10080}
+        short = {"usedPercent": 12, "windowDurationMins": 300}
+        for primary, secondary in [(weekly, short), (short, weekly)]:
+            with self.subTest(primary=primary):
+                result = {"rateLimits": {"limitId": "codex", "primary": short},
+                          "rateLimitsByLimitId": {
+                              "codex": {"limitId": "codex", "primary": primary, "secondary": secondary},
+                              "spark": {"limitId": "spark", "primary": {"usedPercent": 0, "windowDurationMins": 10080}}}}
+                self.assertEqual(cf.weekly_allowance(result), 44)
+        self.assertIsNone(cf.weekly_allowance({"rateLimits": {"primary": short}}))
+        self.assertIsNone(cf.weekly_allowance({"rateLimits": {"limitId": "spark", "primary": weekly}}))
+        self.assertEqual(cf.weekly_allowance({"rateLimits": {"primary": weekly}}), 44)
+        self.assertEqual(cf.weekly_allowance({"rateLimits": {"primary": dict(weekly, usedPercent=100)}}), 0)
+        self.assertIsNone(cf.weekly_allowance({}))
+
+    def test_allowance_cache_refreshes_once_a_minute_and_marks_failed_reads(self):
+        result = {"rateLimits": {"primary": {"usedPercent": 56, "windowDurationMins": 10080}}}
+        reader = cf.SubscriptionAllowance()
+        with mock.patch.object(cf, "read_subscription_limits", return_value=result) as read, \
+             mock.patch.object(cf.time, "monotonic", return_value=100) as clock:
+            first = reader.read()
+            self.assertEqual(first["remaining"], 44)
+            self.assertFalse(first["stale"])
+            self.assertEqual(reader.read(), first)
+            read.assert_called_once()
+            clock.return_value = 161
+            read.side_effect = TimeoutError()
+            stale = reader.read()
+            self.assertEqual(stale["remaining"], 44)
+            self.assertTrue(stale["stale"])
+            self.assertEqual(stale["updated_at"], first["updated_at"])
+            reader.read()
+            self.assertEqual(read.call_count, 2)
+
+    def test_allowance_first_failure_is_unknown_not_zero(self):
+        with mock.patch.object(cf, "read_subscription_limits", side_effect=OSError()):
+            snapshot = cf.SubscriptionAllowance().read()
+        self.assertIsNone(snapshot["remaining"])
+        self.assertTrue(snapshot["stale"])
+
+    def test_subscription_reader_initializes_then_reads_limits_and_exits(self):
+        script = '''import json,sys,time
+init=json.loads(sys.stdin.readline())
+assert init['method']=='initialize'
+print(json.dumps({'id':1,'result':{}}),flush=True)
+assert json.loads(sys.stdin.readline())['method']=='initialized'
+read=json.loads(sys.stdin.readline())
+assert read['method']=='account/rateLimits/read'
+print(json.dumps({'method':'notification','params':{}}),flush=True)
+print(json.dumps({'id':2,'result':{'rateLimits':{'primary':{'usedPercent':56,'windowDurationMins':10080}}}}),flush=True)
+time.sleep(30)
+'''
+        popen = subprocess.Popen
+        children = []
+        def fake_server(command, **kwargs):
+            self.assertEqual(command, ["codex", "app-server", "--stdio"])
+            proc = popen([sys.executable, "-u", "-c", script], **kwargs)
+            children.append(proc)
+            return proc
+        with mock.patch.object(cf.subprocess, "Popen", side_effect=fake_server):
+            self.assertEqual(cf.weekly_allowance(cf.read_subscription_limits()), 44)
+        self.assertIsNotNone(children[0].poll())
+
+    def test_subscription_reader_timeout_reaps_its_process(self):
+        popen = subprocess.Popen
+        children = []
+        def fake_server(command, **kwargs):
+            proc = popen([sys.executable, "-c", "import time;time.sleep(30)"], **kwargs)
+            children.append(proc)
+            return proc
+        with mock.patch.object(cf.subprocess, "Popen", side_effect=fake_server), self.assertRaises(TimeoutError):
+            cf.read_subscription_limits(timeout=.05)
+        self.assertIsNotNone(children[0].poll())
+
     def _write_jsonl(self, path, events):
         text = "".join(json.dumps(event) + "\n" for event in events)
         path.write_text(text, encoding="utf-8")
@@ -1848,4 +2017,3 @@ class EventsMonitorTests(FleetTempHome):
 
         self.assertIsNone(cf.claim_events_lock("session-a"))
         cf.release_events_lock("session-a")
-

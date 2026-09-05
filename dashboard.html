@@ -1,7 +1,12 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#f3f4f6" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0f1114" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-title" content="Codex Fleet">
 <title>codex-fleet</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -43,14 +48,15 @@ html,body{height:100%}
 body{
   margin:0;font-family:var(--sans);font-size:1rem;line-height:1.6;
   background:var(--bg);color:var(--ink);
-  display:grid;grid-template-columns:clamp(300px,22vw,460px) 1fr;height:100vh;overflow:hidden;
+  display:grid;grid-template-columns:clamp(300px,22vw,460px) minmax(0,1fr);height:100vh;height:100dvh;overflow:hidden;
+  padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
   -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
 }
-button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer}
+button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer;touch-action:manipulation}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:6px}
 
 /* ---- sidebar ---- */
-#side{border-right:1px solid var(--line);overflow:auto;background:var(--panel);
+#side{border-right:1px solid var(--line);overflow:auto;min-height:0;background:var(--panel);
   scrollbar-width:thin;scrollbar-color:var(--line2) transparent;display:flex;flex-direction:column}
 #side::-webkit-scrollbar{width:10px}
 #side::-webkit-scrollbar-thumb{background:var(--line2);border-radius:99px;border:3px solid var(--panel)}
@@ -59,6 +65,12 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:poin
   padding:1.4rem 1.4rem 1rem;border-bottom:1px solid var(--line)}
 #head h1{margin:0;font-size:1.05rem;font-weight:600;letter-spacing:-.01em;display:flex;align-items:center;gap:.6rem}
 #head .count{margin-top:.2rem;font-size:.85rem;color:var(--dim)}
+#allowance{margin-top:.8rem}
+#allowance-label{display:flex;justify-content:space-between;gap:.5rem;font-size:.75rem;color:var(--dim)}
+#allowance-left{color:var(--ink2);font-variant-numeric:tabular-nums}
+#allowance-track{height:5px;margin-top:.4rem;overflow:hidden;border-radius:99px;background:var(--line)}
+#allowance-fill{height:100%;width:0;background:var(--run);border-radius:inherit}
+#allowance.stale #allowance-fill{background:var(--dim)}
 .spark{width:.55rem;height:.55rem;border-radius:99px;background:var(--run);flex:0 0 auto;
   box-shadow:0 0 0 .25rem var(--run-soft)}
 .spark.off{background:var(--faint);box-shadow:none}
@@ -90,7 +102,10 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:poin
 .run.sel .last{color:var(--ink)}
 
 /* ---- main column ---- */
-#main{position:relative;min-width:0;overflow:hidden;background:var(--bg)}
+#main{position:relative;min-width:0;min-height:0;overflow:hidden;background:var(--bg)}
+#back{display:none}
+#run-details>summary{display:none}
+#title{overflow-wrap:anywhere;min-width:0}
 /* The header floats over the stream so events scroll under frosted glass. */
 #bar{position:absolute;top:0;left:0;right:0;z-index:5;padding:1.4rem 2.5rem 0;
   background:var(--glass);border-bottom:1px solid var(--line);
@@ -204,23 +219,62 @@ body.none #tools{display:none}
 
 @media(prefers-reduced-motion:reduce){.pill.running::before{animation:none}#jump{transition:none}}
 @media(max-width:860px){
-  body{grid-template-columns:1fr;grid-template-rows:40vh 1fr}
-  #side{border-right:0;border-bottom:1px solid var(--line)}
-  #bar{padding-left:1.2rem;padding-right:1.2rem}
-  #log{padding-left:3.4rem;padding-right:1.2rem}
-  #jump{right:1.2rem}
+  html{font-size:16px}
+  body{grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1fr)}
+  body:not(.view-run) #main,body.view-run #side{display:none}
+  #side{border-right:0;overscroll-behavior-y:contain}
+  #head{padding:1rem 1.1rem}
+  #runs{padding:.5rem .6rem 1rem}
+  .run{padding:.9rem .65rem}
+  .run .nm{font-size:1rem}
+  #bar{padding:.5rem 1rem 0;max-height:65%;overflow-y:auto;overscroll-behavior-y:contain;
+    background:var(--panel);-webkit-backdrop-filter:none;backdrop-filter:none}
+  #back{display:inline-flex;align-items:center;gap:.4rem;min-height:44px;padding:0 .6rem;
+    margin-left:-.6rem;color:var(--link);font-weight:500}
+  #ident{gap:.5rem;align-items:center;flex-wrap:nowrap;padding:.25rem 0 .5rem}
+  #title{font-size:1.2rem;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  #ident .pill{margin-left:auto}
+  #run-details>summary{display:flex;align-items:center;justify-content:space-between;min-height:44px;
+    color:var(--ink2);font-size:.85rem;cursor:pointer;list-style:none;touch-action:manipulation}
+  #run-details>summary::-webkit-details-marker{display:none}
+  #run-details>summary::after{content:"+";font-size:1.2rem;color:var(--dim)}
+  #run-details[open]>summary::after{content:"−"}
+  #facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.8rem 1rem;margin:.5rem 0 1rem}
+  .fact .v{max-width:100%;font-size:.85rem;white-space:normal;overflow-wrap:anywhere}
+  .fact:last-child{grid-column:1/-1}
+  #tools{gap:.5rem;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));padding:.8rem 0;margin:0}
+  #tools .lbl{grid-column:1/-1}
+  .tg{min-height:44px;justify-content:center;padding:.4rem .5rem;font-size:.8rem}
+  #log{padding-left:1rem;padding-right:1rem;padding-bottom:5rem;overscroll-behavior-y:contain}
+  .ev{grid-template-columns:1.2rem minmax(0,1fr);column-gap:.5rem;margin-left:0}
+  .ev.msg{display:block;margin:.9rem 0 1.2rem}
+  .ev.msg>.g{display:none}
+  .ev.msg .t{padding:.9rem 1rem;font-size:1rem}
+  .ev .g{font-size:.7rem}
+  .ev.cmd .t,.ev.file .t,.ev.tool .t{font-size:.78rem}
+  #jump{right:1rem;bottom:1rem;min-height:44px}
+  #empty{padding:2rem 0}
 }
 </style></head><body>
-<div id="side">
+<nav id="side" aria-label="Fleet runs">
   <div id="head">
     <h1><span class="spark off" id="spark"></span>codex-fleet</h1>
     <div class="count" id="count">loading</div>
+    <div id="allowance">
+      <div id="allowance-label"><span>Weekly allowance</span><span id="allowance-left">—</span></div>
+      <div id="allowance-track" role="progressbar" aria-label="Weekly allowance remaining" aria-valuemin="0" aria-valuemax="100">
+        <div id="allowance-fill"></div>
+      </div>
+    </div>
   </div>
   <div id="runs"></div>
-</div>
-<div id="main">
+</nav>
+<main id="main" aria-label="Run activity">
   <div id="bar">
-    <div id="ident"><span id="title">codex-fleet</span><span id="status"></span></div>
+    <button id="back" type="button" aria-label="Back to runs"><span aria-hidden="true">&larr;</span>Runs</button>
+    <div id="ident"><span id="title" tabindex="-1">codex-fleet</span><span id="status"></span></div>
+    <details id="run-details" open>
+    <summary>Details &amp; filters</summary>
     <div id="facts"></div>
     <div id="tools">
       <span class="lbl">Show</span>
@@ -231,18 +285,35 @@ body.none #tools{display:none}
       <button class="tg" data-f="meta" aria-pressed="false"><span class="g">&middot;</span>turn markers</button>
       <button class="tg" id="tg-verb" aria-pressed="false"><span class="g">&#8801;</span>full output</button>
     </div>
+    </details>
   </div>
   <div id="wrap">
-    <div id="log"><div id="stream"><div id="empty">No runs yet. Spawn one with <code>codex-fleet spawn</code> and it appears here.</div></div></div>
+    <div id="log" tabindex="0" aria-label="Event log"><div id="stream"><div id="empty">No runs yet. Spawn one with <code>codex-fleet spawn</code> and it appears here.</div></div></div>
     <button id="jump" hidden>Newer events &darr;</button>
   </div>
-</div>
+</main>
 <script>
-let sel=null,next=0,verbose=false;
+let sel=null,next=0,verbose=false,streamVersion=0,pendingPoll=null;
 const $=id=>document.getElementById(id);
 const log=$("log"),stream=$("stream");
 const esc=t=>(t||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 async function j(u){const r=await fetch(u);return r.json()}
+async function drawAllowance(){
+  try{
+    const data=await j("/api/allowance"),value=data.remaining;
+    const known=typeof value==="number"&&Number.isFinite(value);
+    $("allowance-left").textContent=known?Math.round(value)+"% left"+(data.stale?" · last read":""):"Unavailable";
+    $("allowance-fill").style.width=known?Math.max(0,Math.min(100,value))+"%":"0";
+    $("allowance").classList.toggle("stale",data.stale);
+    $("allowance").title=data.updated_at?"Last read "+new Date(data.updated_at*1000).toLocaleString():"Subscription allowance is unavailable";
+    if(known)$("allowance-track").setAttribute("aria-valuenow",value);
+    else $("allowance-track").removeAttribute("aria-valuenow");
+  }catch{
+    $("allowance").classList.add("stale");
+    const value=$("allowance-track").getAttribute("aria-valuenow");
+    $("allowance-left").textContent=value===null?"Unavailable":Math.round(Number(value))+"% left · last read";
+  }
+}
 
 /* ---- markdown: enough for what an agent writes, nothing more ---- */
 function inline(s){
@@ -347,7 +418,11 @@ function row(e){
 
 /* ---- sidebar and header ---- */
 const plainMd=s=>(s||"").replace(/[*_`#>]/g,"").replace(/\[([^\]]+)\]\([^)]*\)/g,"$1");
-function pick(name){if(sel===name)return;sel=name;next=0;stream.innerHTML="";log.scrollTop=0;
+function pick(name){
+  document.body.classList.add("view-run");
+  if(mobile.matches){$("run-details").open=false;$("title").focus({preventScroll:true});fit()}
+  if(sel===name){log.scrollTop=log.scrollHeight;return}
+  sel=name;next=0;streamVersion++;stream.innerHTML="";log.scrollTop=0;
   $("jump").hidden=true;$("title").textContent=name;draw();poll()}
 function fact(k,v,mono){return "<div class=\"fact\"><span class=\"k\">"+k+"</span><span class=\"v"+(mono?" mono":"")+"\" title=\""+esc(v)+"\">"+esc(v)+"</span></div>"}
 async function draw(){
@@ -358,7 +433,7 @@ async function draw(){
   $("spark").className="spark"+(live.length?"":" off");
   $("count").textContent=live.length?(live.length+" running, "+runs.length+" total"):(runs.length+" runs, none active");
   const card=function(r){
-    return "<button class=\"run "+(r.name===sel?"sel":"")+"\" data-n=\""+esc(r.name)+"\">"
+    return "<button class=\"run "+(r.name===sel?"sel":"")+"\" aria-current=\""+(r.name===sel?"true":"false")+"\" data-n=\""+esc(r.name)+"\">"
       +"<div class=\"top\"><span class=\"nm\">"+esc(r.name)+"</span>"
       +"<span class=\"pill "+r.status+"\">"+r.status+"</span></div>"
       +"<div class=\"meta\"><span>"+esc(r.role)+"</span><span class=\"sep\">&middot;</span>"
@@ -371,8 +446,10 @@ async function draw(){
   let html="";
   if(live.length)html+="<div class=\"grp\">Running ("+live.length+")</div>"+live.map(card).join("");
   if(rest.length)html+="<div class=\"grp\">Finished ("+rest.length+")</div>"+rest.map(card).join("");
-  $("runs").innerHTML=html;
+  const focused=document.activeElement?.dataset.n;
+  $("runs").innerHTML=html||'<div id="empty-runs">No runs yet. New agents will appear here.</div>';
   document.querySelectorAll(".run").forEach(e=>e.onclick=()=>pick(e.dataset.n));
+  if(focused){const button=[...document.querySelectorAll(".run")].find(e=>e.dataset.n===focused);if(button)button.focus({preventScroll:true})}
   const cur=runs.find(r=>r.name===sel);
   $("status").innerHTML=cur?"<span class=\"pill "+cur.status+"\">"+cur.status+"</span>":"";
   $("facts").innerHTML=cur?[
@@ -383,7 +460,12 @@ async function draw(){
 }
 async function poll(){
   if(!sel)return;
-  const d=await j("/api/events?name="+encodeURIComponent(sel)+"&from="+next+"&verbose="+(verbose?1:0));
+  const name=sel,start=next,version=streamVersion,key=version+":"+name+":"+start;
+  if(pendingPoll===key)return;
+  pendingPoll=key;
+  try{
+  const d=await j("/api/events?name="+encodeURIComponent(name)+"&from="+start+"&verbose="+(verbose?1:0));
+  if(name!==sel||version!==streamVersion||start!==next)return;
   if(d.events&&d.events.length){
     const e0=$("empty");if(e0)e0.remove();
     // Measure BEFORE appending: was the reader at the bottom a moment ago?
@@ -392,6 +474,7 @@ async function poll(){
     if(stick)log.scrollTop=log.scrollHeight;else $("jump").hidden=false;
   }
   next=d.total;
+  }finally{if(pendingPoll===key)pendingPoll=null}
 }
 function atBottom(){return log.scrollHeight-log.scrollTop-log.clientHeight<80}
 log.addEventListener("scroll",()=>{if(atBottom())$("jump").hidden=true});
@@ -409,10 +492,18 @@ document.querySelectorAll(".tg[data-f]").forEach(function(el){
   };
 });
 $("tg-verb").onclick=function(){verbose=!verbose;this.setAttribute("aria-pressed",verbose?"true":"false");
-  next=0;stream.innerHTML="";$("jump").hidden=true;
+  next=0;streamVersion++;stream.innerHTML="";$("jump").hidden=true;
   poll().then(()=>{log.scrollTop=log.scrollHeight})};
 const bar=$("bar");
-function fit(){log.style.paddingTop=(bar.offsetHeight+28)+"px"}
+const mobile=matchMedia("(max-width:860px)");
+function layout(){ $("run-details").open=!mobile.matches;fit() }
+function fit(){log.style.paddingTop=(bar.offsetHeight+(mobile.matches?12:28))+"px"}
+$("back").onclick=()=>{
+  document.body.classList.remove("view-run");
+  const selected=document.querySelector(".run.sel");
+  if(selected)selected.focus({preventScroll:true});
+};
+mobile.addEventListener("change",layout);layout();
 new ResizeObserver(fit).observe(bar);fit();
-draw();setInterval(draw,2000);setInterval(poll,1200);
+draw();drawAllowance();setInterval(draw,2000);setInterval(poll,1200);setInterval(drawAllowance,60000);
 </script></body></html>

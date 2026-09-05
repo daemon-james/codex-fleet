@@ -16,12 +16,14 @@ import io
 import json
 import os
 import re
+import select
 import shutil
 import signal
 import socket
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,10 +34,20 @@ RUNS = ROOT / "runs"
 # Deliberately narrow. Role picks the model; nothing else is orchestrated here.
 #   engineer -> gpt-5.6-sol    (writing, refactoring, debugging, investigation)
 #   reviewer -> gpt-5.6-terra  (code review, critique, verification)
-ROLES = {"engineer": "gpt-5.6-sol", "reviewer": "gpt-5.6-terra"}
+#   advanced-engineer -> gpt-6-astra (complex, demanding engineering)
+ROLES = {
+    "engineer": "gpt-5.6-sol",
+    "reviewer": "gpt-5.6-terra",
+    "advanced-engineer": "gpt-6-astra",
+}
 MODELS = list(ROLES.values())
-# high for ordinary work, xhigh for complex or high-risk work.
-EFFORTS = ["high", "xhigh"]
+EFFORTS = {
+    "engineer": ["high", "xhigh"],
+    "reviewer": ["high", "xhigh"],
+    "advanced-engineer": ["medium", "high", "xhigh"],
+}
+DEFAULT_EFFORT = "high"
+EFFORT_CHOICES = list(dict.fromkeys(e for levels in EFFORTS.values() for e in levels))
 
 C = {
     "dim": "\033[2m",
@@ -498,6 +510,18 @@ def launch(name, meta, prompt, resume_id=None):
     # it the hook stays silent, which is also what every interactive Codex
     # session on this machine wants.
     child_env = dict(os.environ, CODEX_FLEET_RUN=name)
+    # A worktree cwd resolves to no project: Mnemonik's server is remote and
+    # cannot read the .mnemonik.json sitting right there in the worktree, so
+    # every agent's first recall fails and it burns a turn working out that it
+    # must retry with an explicit id. Read the id here, where the file IS
+    # readable, and hand it over.
+    pid_file = Path(meta.get("worktree_root") or meta["cwd"]) / ".mnemonik.json"
+    try:
+        ident = json.loads(pid_file.read_text())
+        if isinstance(ident.get("projectId"), str):
+            child_env["MNEMONIK_PROJECT_ID"] = ident["projectId"]
+    except (OSError, ValueError, KeyError):
+        pass
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.DEVNULL,
@@ -574,6 +598,21 @@ def make_worktree(name, base_cwd):
                 os.chmod(wt / f, 0o600)
             except OSError:
                 pass
+
+    # Workspace builds. COPY, never symlink: a linked dist means an agent that
+    # rebuilds writes into the main checkout, and an agent that tidies its diff
+    # deletes a build the main tree is using. Both have happened. ~2MB total,
+    # against agents burning a turn deciding whether node_modules is trustworthy
+    # because "six workspace builds are absent".
+    for src_dist in sorted((Path(root) / "packages").glob("*/dist")):
+        dest = wt / src_dist.relative_to(root)
+        if dest.exists():
+            continue
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(src_dist, dest, symlinks=True)
+        except OSError:
+            pass
     return str(wt), branch, root
 
 
@@ -625,7 +664,15 @@ def owned_here(meta, owner=None):
     return owner is None or run_owner == owner
 
 
+def resolve_effort(role, effort):
+    effort = effort or DEFAULT_EFFORT
+    if effort not in EFFORTS[role]:
+        die(f"{role} supports efforts: {', '.join(EFFORTS[role])}", 2)
+    return effort
+
+
 def cmd_spawn(args):
+    effort = resolve_effort(args.role, args.effort)
     if not shutil.which("codex"):
         die("codex CLI not found on PATH")
     name = args.name or slug(args.prompt)
@@ -647,7 +694,7 @@ def cmd_spawn(args):
         "name": name,
         "role": args.role,
         "model": ROLES[args.role],
-        "effort": args.effort,
+        "effort": effort,
         "sandbox": "danger-full-access",
         "owner": current_owner(),
         # 0 means "no turn read yet". The Stop hook blocks ending the turn while
@@ -691,7 +738,7 @@ def cmd_list(args):
     if not runs:
         print("no runs")
         return
-    header = f"{'NAME':<24} {'STATUS':<9} {'ROLE':<9} {'MODEL':<15} {'EFFORT':<7} {'TURNS':<6} {'TOK(out)':<9} {'AGE':<5} LAST"
+    header = f"{'NAME':<24} {'STATUS':<9} {'ROLE':<17} {'MODEL':<15} {'EFFORT':<7} {'TURNS':<6} {'TOK(out)':<9} {'AGE':<5} LAST"
     print(paint(header, "bold"))
     for name, meta in runs:
         st = status_of(name, meta)
@@ -709,7 +756,7 @@ def cmd_list(args):
         role = meta.get("role", "-")
         foreign = "" if owned_here(meta) else paint("  [other session]", "dim")
         print(
-            f"{name:<24} {paint(f'{st:<9}', colour)} {role:<9} {meta['model']:<15} {meta['effort']:<7} "
+            f"{name:<24} {paint(f'{st:<9}', colour)} {role:<17} {meta['model']:<15} {meta['effort']:<7} "
             f"{meta.get('turns', 0):<6} {render_output_tokens(events, meta):<9} "
             f"{age(latest, meta):<5} {msg}{foreign}"
         )
@@ -883,7 +930,7 @@ def cmd_say(args):
     if not meta.get("thread_id"):
         die(f"{args.name} has no thread id; cannot resume")
     if args.effort:
-        meta["effort"] = args.effort
+        meta["effort"] = resolve_effort(meta.get("role", "engineer"), args.effort)
     note = refresh_worktree(meta)
     if note:
         print(f"  worktree {note}")
@@ -1854,13 +1901,14 @@ def cmd_models(args):
         for m in json.loads(cache.read_text()).get("models", []):
             catalog[m["slug"]] = [e["effort"] for e in m.get("supported_reasoning_levels") or []]
     for role, slug_name in sorted(ROLES.items()):
+        efforts = EFFORTS[role]
         known = catalog.get(slug_name)
         if known is None:
             note = paint("not in local catalog", "yellow")
         else:
-            missing = [e for e in EFFORTS if e not in known]
+            missing = [e for e in efforts if e not in known]
             note = paint(f"unsupported: {','.join(missing)}", "red") if missing else "ok"
-        print(f"{role:<9} {slug_name:<16} efforts={','.join(EFFORTS):<12} {note}")
+        print(f"{role:<17} {slug_name:<16} efforts={','.join(efforts):<17} default={DEFAULT_EFFORT:<6} {note}")
 
 
 # ---------------------------------------------------------------- serve
@@ -1941,10 +1989,98 @@ def run_events(name, start, verbose):
     return {"total": len(events), "events": out, "status": status_of(name, meta)}
 
 
+def read_subscription_limits(timeout=10):
+    """Read account limits through Codex; no thread, model turn or MCP startup."""
+    with subprocess.Popen(
+        ["codex", "app-server", "--stdio"], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    ) as proc:
+        def send(message):
+            proc.stdin.write((json.dumps(message) + "\n").encode())
+            proc.stdin.flush()
+
+        try:
+            send({"id": 1, "method": "initialize", "params": {
+                "clientInfo": {"name": "codex_fleet_usage", "version": "1.0"}}})
+            deadline = time.monotonic() + timeout
+            buffer = b""
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([proc.stdout], [], [], max(0, deadline - time.monotonic()))
+                if not ready:
+                    break
+                chunk = os.read(proc.stdout.fileno(), 65536)
+                if not chunk:
+                    raise RuntimeError("Codex usage reader exited")
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    message = json.loads(line)
+                    if message.get("id") not in (1, 2):
+                        continue
+                    if "error" in message:
+                        raise RuntimeError("Codex could not read subscription allowance")
+                    if message["id"] == 1:
+                        send({"method": "initialized"})
+                        send({"id": 2, "method": "account/rateLimits/read"})
+                    else:
+                        return message["result"]
+            raise TimeoutError("Codex usage read timed out")
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+
+def weekly_allowance(result):
+    # The fleet uses the main Codex allowance, not unrelated model buckets.
+    limits = (result.get("rateLimitsByLimitId") or {}).get("codex") or result.get("rateLimits") or {}
+    if limits.get("limitId") not in (None, "codex"):
+        return None
+    for key in ("primary", "secondary"):
+        window = limits.get(key) or {}
+        used, minutes = window.get("usedPercent"), window.get("windowDurationMins")
+        if not isinstance(used, (int, float)) or minutes != 10080:
+            continue
+        return max(0, min(100, 100 - used))
+    return None
+
+
+class SubscriptionAllowance:
+    """One short read per minute across every dashboard viewer."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.next_read = 0
+        self.snapshot = {"remaining": None, "updated_at": None, "stale": False}
+
+    def read(self):
+        with self.lock:
+            if time.monotonic() < self.next_read:
+                return self.snapshot
+            try:
+                remaining = weekly_allowance(read_subscription_limits())
+                self.snapshot = {"remaining": remaining, "updated_at": time.time(), "stale": False}
+            except (OSError, ValueError, RuntimeError, KeyError):
+                self.snapshot = dict(self.snapshot, stale=True)
+            self.next_read = time.monotonic() + 60
+            return self.snapshot
+
+
+# Browser icons: PNG is the 180px rendering of the SVG for iOS Home Screen.
+SERVE_ICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#16191d"/><path d="m15 13 8 7-8 7m0 0 8 7-8 7m0 0 8 7-8 7" fill="none" stroke="#e8ebee" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/><path d="M34 20h14M34 34h14M34 48h14" stroke="#3fcf8e" stroke-width="4" stroke-linecap="round"/></svg>'
+SERVE_ICON_PNG = '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'
+
 SERVE_PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#f3f4f6" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0f1114" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-title" content="Codex Fleet">
 <title>codex-fleet</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -1986,14 +2122,15 @@ html,body{height:100%}
 body{
   margin:0;font-family:var(--sans);font-size:1rem;line-height:1.6;
   background:var(--bg);color:var(--ink);
-  display:grid;grid-template-columns:clamp(300px,22vw,460px) 1fr;height:100vh;overflow:hidden;
+  display:grid;grid-template-columns:clamp(300px,22vw,460px) minmax(0,1fr);height:100vh;height:100dvh;overflow:hidden;
+  padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
   -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
 }
-button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer}
+button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer;touch-action:manipulation}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:6px}
 
 /* ---- sidebar ---- */
-#side{border-right:1px solid var(--line);overflow:auto;background:var(--panel);
+#side{border-right:1px solid var(--line);overflow:auto;min-height:0;background:var(--panel);
   scrollbar-width:thin;scrollbar-color:var(--line2) transparent;display:flex;flex-direction:column}
 #side::-webkit-scrollbar{width:10px}
 #side::-webkit-scrollbar-thumb{background:var(--line2);border-radius:99px;border:3px solid var(--panel)}
@@ -2002,6 +2139,12 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:poin
   padding:1.4rem 1.4rem 1rem;border-bottom:1px solid var(--line)}
 #head h1{margin:0;font-size:1.05rem;font-weight:600;letter-spacing:-.01em;display:flex;align-items:center;gap:.6rem}
 #head .count{margin-top:.2rem;font-size:.85rem;color:var(--dim)}
+#allowance{margin-top:.8rem}
+#allowance-label{display:flex;justify-content:space-between;gap:.5rem;font-size:.75rem;color:var(--dim)}
+#allowance-left{color:var(--ink2);font-variant-numeric:tabular-nums}
+#allowance-track{height:5px;margin-top:.4rem;overflow:hidden;border-radius:99px;background:var(--line)}
+#allowance-fill{height:100%;width:0;background:var(--run);border-radius:inherit}
+#allowance.stale #allowance-fill{background:var(--dim)}
 .spark{width:.55rem;height:.55rem;border-radius:99px;background:var(--run);flex:0 0 auto;
   box-shadow:0 0 0 .25rem var(--run-soft)}
 .spark.off{background:var(--faint);box-shadow:none}
@@ -2033,7 +2176,10 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:poin
 .run.sel .last{color:var(--ink)}
 
 /* ---- main column ---- */
-#main{position:relative;min-width:0;overflow:hidden;background:var(--bg)}
+#main{position:relative;min-width:0;min-height:0;overflow:hidden;background:var(--bg)}
+#back{display:none}
+#run-details>summary{display:none}
+#title{overflow-wrap:anywhere;min-width:0}
 /* The header floats over the stream so events scroll under frosted glass. */
 #bar{position:absolute;top:0;left:0;right:0;z-index:5;padding:1.4rem 2.5rem 0;
   background:var(--glass);border-bottom:1px solid var(--line);
@@ -2147,23 +2293,62 @@ body.none #tools{display:none}
 
 @media(prefers-reduced-motion:reduce){.pill.running::before{animation:none}#jump{transition:none}}
 @media(max-width:860px){
-  body{grid-template-columns:1fr;grid-template-rows:40vh 1fr}
-  #side{border-right:0;border-bottom:1px solid var(--line)}
-  #bar{padding-left:1.2rem;padding-right:1.2rem}
-  #log{padding-left:3.4rem;padding-right:1.2rem}
-  #jump{right:1.2rem}
+  html{font-size:16px}
+  body{grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1fr)}
+  body:not(.view-run) #main,body.view-run #side{display:none}
+  #side{border-right:0;overscroll-behavior-y:contain}
+  #head{padding:1rem 1.1rem}
+  #runs{padding:.5rem .6rem 1rem}
+  .run{padding:.9rem .65rem}
+  .run .nm{font-size:1rem}
+  #bar{padding:.5rem 1rem 0;max-height:65%;overflow-y:auto;overscroll-behavior-y:contain;
+    background:var(--panel);-webkit-backdrop-filter:none;backdrop-filter:none}
+  #back{display:inline-flex;align-items:center;gap:.4rem;min-height:44px;padding:0 .6rem;
+    margin-left:-.6rem;color:var(--link);font-weight:500}
+  #ident{gap:.5rem;align-items:center;flex-wrap:nowrap;padding:.25rem 0 .5rem}
+  #title{font-size:1.2rem;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  #ident .pill{margin-left:auto}
+  #run-details>summary{display:flex;align-items:center;justify-content:space-between;min-height:44px;
+    color:var(--ink2);font-size:.85rem;cursor:pointer;list-style:none;touch-action:manipulation}
+  #run-details>summary::-webkit-details-marker{display:none}
+  #run-details>summary::after{content:"+";font-size:1.2rem;color:var(--dim)}
+  #run-details[open]>summary::after{content:"−"}
+  #facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.8rem 1rem;margin:.5rem 0 1rem}
+  .fact .v{max-width:100%;font-size:.85rem;white-space:normal;overflow-wrap:anywhere}
+  .fact:last-child{grid-column:1/-1}
+  #tools{gap:.5rem;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));padding:.8rem 0;margin:0}
+  #tools .lbl{grid-column:1/-1}
+  .tg{min-height:44px;justify-content:center;padding:.4rem .5rem;font-size:.8rem}
+  #log{padding-left:1rem;padding-right:1rem;padding-bottom:5rem;overscroll-behavior-y:contain}
+  .ev{grid-template-columns:1.2rem minmax(0,1fr);column-gap:.5rem;margin-left:0}
+  .ev.msg{display:block;margin:.9rem 0 1.2rem}
+  .ev.msg>.g{display:none}
+  .ev.msg .t{padding:.9rem 1rem;font-size:1rem}
+  .ev .g{font-size:.7rem}
+  .ev.cmd .t,.ev.file .t,.ev.tool .t{font-size:.78rem}
+  #jump{right:1rem;bottom:1rem;min-height:44px}
+  #empty{padding:2rem 0}
 }
 </style></head><body>
-<div id="side">
+<nav id="side" aria-label="Fleet runs">
   <div id="head">
     <h1><span class="spark off" id="spark"></span>codex-fleet</h1>
     <div class="count" id="count">loading</div>
+    <div id="allowance">
+      <div id="allowance-label"><span>Weekly allowance</span><span id="allowance-left">—</span></div>
+      <div id="allowance-track" role="progressbar" aria-label="Weekly allowance remaining" aria-valuemin="0" aria-valuemax="100">
+        <div id="allowance-fill"></div>
+      </div>
+    </div>
   </div>
   <div id="runs"></div>
-</div>
-<div id="main">
+</nav>
+<main id="main" aria-label="Run activity">
   <div id="bar">
-    <div id="ident"><span id="title">codex-fleet</span><span id="status"></span></div>
+    <button id="back" type="button" aria-label="Back to runs"><span aria-hidden="true">&larr;</span>Runs</button>
+    <div id="ident"><span id="title" tabindex="-1">codex-fleet</span><span id="status"></span></div>
+    <details id="run-details" open>
+    <summary>Details &amp; filters</summary>
     <div id="facts"></div>
     <div id="tools">
       <span class="lbl">Show</span>
@@ -2174,18 +2359,35 @@ body.none #tools{display:none}
       <button class="tg" data-f="meta" aria-pressed="false"><span class="g">&middot;</span>turn markers</button>
       <button class="tg" id="tg-verb" aria-pressed="false"><span class="g">&#8801;</span>full output</button>
     </div>
+    </details>
   </div>
   <div id="wrap">
-    <div id="log"><div id="stream"><div id="empty">No runs yet. Spawn one with <code>codex-fleet spawn</code> and it appears here.</div></div></div>
+    <div id="log" tabindex="0" aria-label="Event log"><div id="stream"><div id="empty">No runs yet. Spawn one with <code>codex-fleet spawn</code> and it appears here.</div></div></div>
     <button id="jump" hidden>Newer events &darr;</button>
   </div>
-</div>
+</main>
 <script>
-let sel=null,next=0,verbose=false;
+let sel=null,next=0,verbose=false,streamVersion=0,pendingPoll=null;
 const $=id=>document.getElementById(id);
 const log=$("log"),stream=$("stream");
 const esc=t=>(t||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 async function j(u){const r=await fetch(u);return r.json()}
+async function drawAllowance(){
+  try{
+    const data=await j("/api/allowance"),value=data.remaining;
+    const known=typeof value==="number"&&Number.isFinite(value);
+    $("allowance-left").textContent=known?Math.round(value)+"% left"+(data.stale?" · last read":""):"Unavailable";
+    $("allowance-fill").style.width=known?Math.max(0,Math.min(100,value))+"%":"0";
+    $("allowance").classList.toggle("stale",data.stale);
+    $("allowance").title=data.updated_at?"Last read "+new Date(data.updated_at*1000).toLocaleString():"Subscription allowance is unavailable";
+    if(known)$("allowance-track").setAttribute("aria-valuenow",value);
+    else $("allowance-track").removeAttribute("aria-valuenow");
+  }catch{
+    $("allowance").classList.add("stale");
+    const value=$("allowance-track").getAttribute("aria-valuenow");
+    $("allowance-left").textContent=value===null?"Unavailable":Math.round(Number(value))+"% left · last read";
+  }
+}
 
 /* ---- markdown: enough for what an agent writes, nothing more ---- */
 function inline(s){
@@ -2290,7 +2492,11 @@ function row(e){
 
 /* ---- sidebar and header ---- */
 const plainMd=s=>(s||"").replace(/[*_`#>]/g,"").replace(/\[([^\]]+)\]\([^)]*\)/g,"$1");
-function pick(name){if(sel===name)return;sel=name;next=0;stream.innerHTML="";log.scrollTop=0;
+function pick(name){
+  document.body.classList.add("view-run");
+  if(mobile.matches){$("run-details").open=false;$("title").focus({preventScroll:true});fit()}
+  if(sel===name){log.scrollTop=log.scrollHeight;return}
+  sel=name;next=0;streamVersion++;stream.innerHTML="";log.scrollTop=0;
   $("jump").hidden=true;$("title").textContent=name;draw();poll()}
 function fact(k,v,mono){return "<div class=\"fact\"><span class=\"k\">"+k+"</span><span class=\"v"+(mono?" mono":"")+"\" title=\""+esc(v)+"\">"+esc(v)+"</span></div>"}
 async function draw(){
@@ -2301,7 +2507,7 @@ async function draw(){
   $("spark").className="spark"+(live.length?"":" off");
   $("count").textContent=live.length?(live.length+" running, "+runs.length+" total"):(runs.length+" runs, none active");
   const card=function(r){
-    return "<button class=\"run "+(r.name===sel?"sel":"")+"\" data-n=\""+esc(r.name)+"\">"
+    return "<button class=\"run "+(r.name===sel?"sel":"")+"\" aria-current=\""+(r.name===sel?"true":"false")+"\" data-n=\""+esc(r.name)+"\">"
       +"<div class=\"top\"><span class=\"nm\">"+esc(r.name)+"</span>"
       +"<span class=\"pill "+r.status+"\">"+r.status+"</span></div>"
       +"<div class=\"meta\"><span>"+esc(r.role)+"</span><span class=\"sep\">&middot;</span>"
@@ -2314,8 +2520,10 @@ async function draw(){
   let html="";
   if(live.length)html+="<div class=\"grp\">Running ("+live.length+")</div>"+live.map(card).join("");
   if(rest.length)html+="<div class=\"grp\">Finished ("+rest.length+")</div>"+rest.map(card).join("");
-  $("runs").innerHTML=html;
+  const focused=document.activeElement?.dataset.n;
+  $("runs").innerHTML=html||'<div id="empty-runs">No runs yet. New agents will appear here.</div>';
   document.querySelectorAll(".run").forEach(e=>e.onclick=()=>pick(e.dataset.n));
+  if(focused){const button=[...document.querySelectorAll(".run")].find(e=>e.dataset.n===focused);if(button)button.focus({preventScroll:true})}
   const cur=runs.find(r=>r.name===sel);
   $("status").innerHTML=cur?"<span class=\"pill "+cur.status+"\">"+cur.status+"</span>":"";
   $("facts").innerHTML=cur?[
@@ -2326,7 +2534,12 @@ async function draw(){
 }
 async function poll(){
   if(!sel)return;
-  const d=await j("/api/events?name="+encodeURIComponent(sel)+"&from="+next+"&verbose="+(verbose?1:0));
+  const name=sel,start=next,version=streamVersion,key=version+":"+name+":"+start;
+  if(pendingPoll===key)return;
+  pendingPoll=key;
+  try{
+  const d=await j("/api/events?name="+encodeURIComponent(name)+"&from="+start+"&verbose="+(verbose?1:0));
+  if(name!==sel||version!==streamVersion||start!==next)return;
   if(d.events&&d.events.length){
     const e0=$("empty");if(e0)e0.remove();
     // Measure BEFORE appending: was the reader at the bottom a moment ago?
@@ -2335,6 +2548,7 @@ async function poll(){
     if(stick)log.scrollTop=log.scrollHeight;else $("jump").hidden=false;
   }
   next=d.total;
+  }finally{if(pendingPoll===key)pendingPoll=null}
 }
 function atBottom(){return log.scrollHeight-log.scrollTop-log.clientHeight<80}
 log.addEventListener("scroll",()=>{if(atBottom())$("jump").hidden=true});
@@ -2352,19 +2566,29 @@ document.querySelectorAll(".tg[data-f]").forEach(function(el){
   };
 });
 $("tg-verb").onclick=function(){verbose=!verbose;this.setAttribute("aria-pressed",verbose?"true":"false");
-  next=0;stream.innerHTML="";$("jump").hidden=true;
+  next=0;streamVersion++;stream.innerHTML="";$("jump").hidden=true;
   poll().then(()=>{log.scrollTop=log.scrollHeight})};
 const bar=$("bar");
-function fit(){log.style.paddingTop=(bar.offsetHeight+28)+"px"}
+const mobile=matchMedia("(max-width:860px)");
+function layout(){ $("run-details").open=!mobile.matches;fit() }
+function fit(){log.style.paddingTop=(bar.offsetHeight+(mobile.matches?12:28))+"px"}
+$("back").onclick=()=>{
+  document.body.classList.remove("view-run");
+  const selected=document.querySelector(".run.sel");
+  if(selected)selected.focus({preventScroll:true});
+};
+mobile.addEventListener("change",layout);layout();
 new ResizeObserver(fit).observe(bar);fit();
-draw();setInterval(draw,2000);setInterval(poll,1200);
+draw();drawAllowance();setInterval(draw,2000);setInterval(poll,1200);setInterval(drawAllowance,60000);
 </script></body></html>
 """
 
 
 def cmd_serve(args):
+    import base64
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from urllib.parse import urlparse, parse_qs
+    allowance = SubscriptionAllowance()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -2381,7 +2605,19 @@ def cmd_serve(args):
         def do_GET(self):
             u = urlparse(self.path)
             q = parse_qs(u.query)
+            if u.path in ("/favicon.svg", "/favicon.ico", "/apple-touch-icon.png"):
+                svg = u.path == "/favicon.svg"
+                body = SERVE_ICON_SVG.encode() if svg else base64.b64decode(SERVE_ICON_PNG)
+                self.send_response(200)
+                self.send_header("Content-Type", "image/svg+xml" if svg else "image/png")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "public, max-age=86400")
+                self.end_headers()
+                self.wfile.write(body)
+                return
             try:
+                if u.path == "/api/allowance":
+                    return self.send_json(allowance.read())
                 if u.path == "/api/runs":
                     return self.send_json(run_rows())
                 if u.path == "/api/events":
@@ -2447,11 +2683,13 @@ def main():
         "-r",
         default="engineer",
         choices=sorted(ROLES),
-        help="engineer=gpt-5.6-sol (build/debug), reviewer=gpt-5.6-terra (review/critique)",
+        help="engineer=gpt-5.6-sol (build/debug), reviewer=gpt-5.6-terra (review/critique), "
+             "advanced-engineer=gpt-6-astra (complex engineering)",
     )
     sp.add_argument(
-        "--effort", "-e", default="high", choices=EFFORTS,
-        help="high for ordinary work, xhigh for complex or high-risk work",
+        "--effort", "-e", default=DEFAULT_EFFORT, choices=EFFORT_CHOICES,
+        help="default: high; "
+             "medium is only available to advanced-engineer; xhigh for the hardest work",
     )
     sp.add_argument("--cd", "-C", default=".")
     sp.add_argument(
@@ -2495,7 +2733,8 @@ def main():
     yp = sub.add_parser("say", help="send a follow-up into an idle agent's session")
     yp.add_argument("name")
     yp.add_argument("prompt")
-    yp.add_argument("--effort", "-e", choices=EFFORTS)
+    yp.add_argument("--effort", "-e", choices=EFFORT_CHOICES,
+                    help="change effort within the run's role; omitted keeps its current effort")
     yp.add_argument("--follow", "-f", action="store_true")
     yp.add_argument("--verbose", "-v", action="store_true")
     yp.set_defaults(func=cmd_say)

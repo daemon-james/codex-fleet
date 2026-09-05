@@ -81,6 +81,23 @@ string. The string is a raw literal (`r"""`), so the page's JavaScript may use
 backslashes; the tool refuses a triple quote, a control character, or a
 trailing backslash, and reads its own output back to confirm it survived.
 
+**Mobile has two views.** Below 861px, the run list and activity view each use
+the full available screen; `view-run` selects the activity view. Details and
+filters collapse on phones and open on desktop. Keep dynamic viewport height,
+safe-area padding and 44px touch controls. Verify selection, back navigation,
+scrolling, filters and orientation changes in WebKit as well as Chromium.
+Late event responses must be discarded when the selected run or output mode
+changes. The SVG favicon and its 180px PNG rendering are embedded in
+`SERVE_ICON_SVG` and `SERVE_ICON_PNG`, keeping the installed CLI standalone.
+
+**Allowance is an account read, not a model run.** `/api/allowance` reads
+`account/rateLimits/read` through a short-lived Codex app-server and caches
+the result for one minute across viewers. It creates no agent thread. Select
+the main `codex` bucket and the 10080-minute window, whichever slot contains
+it; primary is not always the five-hour window. Return only the remaining
+percentage and freshness metadata to the browser. A failed refresh keeps the
+last reading marked stale; missing weekly data is unavailable, never zero.
+
 **Sort keys must stop moving.** Sorting runs by last-event time reads correctly
 and behaves terribly: a live agent rewrites its log every second, so two running
 agents swap places continuously and the list jumps under the reader. Running
@@ -234,10 +251,19 @@ it.
 with imports would need installing inside every sandbox. The dashboard is the
 only part big enough to hurt, and `embed-page.py` handles that.
 
-**Two roles, two efforts, no `--model` flag.** `engineer` is `gpt-5.6-sol`,
-`reviewer` is `gpt-5.6-terra`. Constraining it stops the orchestrator from
-fiddling with model choice per task and stops a reviewer being handed build
-work.
+**Three roles, no `--model` flag.** `engineer` is `gpt-5.6-sol`, `reviewer` is
+`gpt-5.6-terra`, and Advanced Engineer (`advanced-engineer`) is `gpt-6-astra`.
+High is the default effort for all roles. Engineer and Reviewer allow High and
+Extra High; Advanced Engineer also allows Medium. Validate the role's effort
+before creating a run or resuming a turn. A resume without `-e` keeps the saved
+effort. Keep the Claude Code skill's role and task-selection tables in sync
+with these choices. Astra handles unclear bugs, changes across modules,
+architecture and compatibility work. Sol handles specified, isolated
+implementation and repetitive work. Terra is the default independent reviewer
+of either model's changes; a separate Astra agent can investigate unresolved
+system-wide questions from a review. High remains the default even for Astra;
+Extra High is an explicit choice for especially difficult reasoning. A review
+must use a separate agent from the one that wrote the change.
 
 **Prune collapses, it does not delete.** 99.4% of a run's disk is its event log.
 The `thread_id` is what makes a finished agent worth keeping, because `say`

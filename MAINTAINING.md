@@ -61,7 +61,7 @@ kill $(pgrep -f "^python3 .*codex-fleet serve")
 codex-fleet serve --port 8787 --host 0.0.0.0 &
 ```
 
-For an orchestrator-owned dashboard use `serve --daemon`, whose PID and log live at `~/.codex-fleet/serve.pid` and `~/.codex-fleet/serve.log`, and restart it with `serve --stop` followed by `serve --daemon`; ask events must keep the full text and explicit blocking flag, `inbox --all` is the read-question history, and every latest-turn reader must preserve `mcp=<ok>/<failed>` with a pruned-metadata fallback.
+For an orchestrator-owned dashboard use `serve --daemon`, whose PID and log live at `~/.codex-fleet/serve.pid` and `~/.codex-fleet/serve.log`, and restart it with `serve --stop` followed by `serve --daemon`; ask events must keep the full text and explicit blocking flag, `inbox --all` is the read-question history, every latest-turn reader must preserve `mcp=<ok>/<failed>` with a pruned-metadata fallback, and serve polling must retain per-file byte offsets unless a log shrinks.
 
 **Anchor every `pgrep`/`pkill` pattern.** `pkill -f "codex-fleet serve"` matches
 the shell running that very command and kills your own session. Use

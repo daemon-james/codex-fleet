@@ -181,14 +181,16 @@ def all_events(name, meta):
     return events
 
 
-def status_of(name, meta):
+def status_of(name, meta, latest_events=None):
     if alive(meta.get("pid")):
         return "running"
     # A pruned run has no event log left. Its outcome was recorded before the
     # log went, so read that rather than guessing "stopped" from an empty file.
     if meta.get("pruned_at"):
         return meta.get("final_status", "idle")
-    events = read_events(run_dir(name) / f"turn-{meta.get('turns', 1)}.jsonl")
+    events = latest_events
+    if events is None:
+        events = read_events(run_dir(name) / f"turn-{meta.get('turns', 1)}.jsonl")
     for ev in reversed(events):
         t = ev.get("type")
         if t == "turn.completed":
@@ -1999,15 +2001,70 @@ def event_kind(ev):
     return "meta"
 
 
-def run_rows():
+class TurnLogReader:
+    """Cache parsed turn logs and consume only bytes appended since the last poll."""
+
+    def __init__(self):
+        self.files = {}
+        self.lock = threading.Lock()
+        self.bytes_read = 0
+
+    def _read(self, path):
+        try:
+            size = path.stat().st_size
+        except OSError:
+            self.files.pop(path, None)
+            return []
+        state = self.files.get(path)
+        if state is None or size < state["offset"]:
+            state = {"offset": 0, "pending": b"", "events": []}
+            self.files[path] = state
+        if size == state["offset"]:
+            return state["events"]
+        try:
+            with path.open("rb") as fh:
+                fh.seek(state["offset"])
+                chunk = fh.read()
+        except OSError:
+            return state["events"]
+        state["offset"] += len(chunk)
+        self.bytes_read += len(chunk)
+        lines = (state["pending"] + chunk).split(b"\n")
+        state["pending"] = lines.pop()
+        for raw in lines:
+            raw = raw.strip()
+            if not raw:
+                continue
+            text = raw.decode("utf-8", "replace")
+            try:
+                state["events"].append(json.loads(text))
+            except json.JSONDecodeError:
+                state["events"].append({"type": "_unparsed", "raw": text})
+        return state["events"]
+
+    def read(self, path):
+        with self.lock:
+            return list(self._read(path))
+
+    def all(self, name, meta):
+        with self.lock:
+            events = []
+            for path in turn_files(name, meta):
+                events.extend(self._read(path))
+            return events
+
+
+def run_rows(logs=None):
     rows = []
     for name, meta in all_runs():
-        events = all_events(name, meta)
+        events = logs.all(name, meta) if logs else all_events(name, meta)
+        latest = run_dir(name) / f"turn-{meta.get('turns', 1)}.jsonl"
+        latest_events = logs.read(latest) if logs else None
         usage = usage_of(events, meta)
         rows.append(
             {
                 "name": name,
-                "status": status_of(name, meta),
+                "status": status_of(name, meta, latest_events),
                 "role": meta.get("role", "?"),
                 "model": meta.get("model", "?"),
                 "effort": meta.get("effort", "?"),
@@ -2026,18 +2083,22 @@ def run_rows():
     return rows  # all_runs() already ordered by most recent activity
 
 
-def run_events(name, start, verbose):
+def run_events(name, start, verbose, logs=None):
     meta = load_meta(name)
-    events = all_events(name, meta)
+    events = logs.all(name, meta) if logs else all_events(name, meta)
     out = []
-    for i, ev in enumerate(events):
-        if i < start:
-            continue
+    for i, ev in enumerate(events[start:], start):
         line = describe(ev, verbose=verbose)
         if line is None:
             continue
         out.append({"i": i, "kind": event_kind(ev), "text": plain(line)})
-    return {"total": len(events), "events": out, "status": status_of(name, meta)}
+    latest = run_dir(name) / f"turn-{meta.get('turns', 1)}.jsonl"
+    latest_events = logs.read(latest) if logs else None
+    return {
+        "total": len(events),
+        "events": out,
+        "status": status_of(name, meta, latest_events),
+    }
 
 
 def read_subscription_limits(timeout=10):
@@ -2732,6 +2793,7 @@ def cmd_serve(args):
             return
 
     allowance = SubscriptionAllowance()
+    logs = TurnLogReader()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -2762,14 +2824,14 @@ def cmd_serve(args):
                 if u.path == "/api/allowance":
                     return self.send_json(allowance.read())
                 if u.path == "/api/runs":
-                    return self.send_json(run_rows())
+                    return self.send_json(run_rows(logs))
                 if u.path == "/api/events":
                     name = (q.get("name") or [""])[0]
                     start = int((q.get("from") or ["0"])[0])
                     verbose = (q.get("verbose") or ["0"])[0] == "1"
                     if not (run_dir(name) / "meta.json").exists():
                         return self.send_json({"total": 0, "events": [], "status": "stopped"})
-                    return self.send_json(run_events(name, start, verbose))
+                    return self.send_json(run_events(name, start, verbose, logs))
             except Exception as exc:  # a dashboard must not die on one bad run
                 return self.send_json({"error": str(exc)})
             body = SERVE_PAGE.encode()

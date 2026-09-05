@@ -565,6 +565,33 @@ time.sleep(30)
             cf.cmd_events(argparse.Namespace(all=True))
         self.assertIn("finished mcp-run (engineer) mcp=2/1", stream.getvalue())
 
+    def test_serve_turn_reader_reads_only_bytes_appended_since_the_last_poll(self):
+        run, _meta = self._make_run("growing", pid=os.getpid())
+        path = run / "turn-1.jsonl"
+        first = (json.dumps({"type": "turn.started"}) + "\n").encode()
+        path.write_bytes(first)
+        logs = cf.TurnLogReader()
+
+        initial = cf.run_events("growing", 0, False, logs)
+        self.assertEqual(logs.bytes_read, len(first))
+        appended = (
+            json.dumps({"type": "item.completed", "item": {"type": "reasoning", "text": "new"}})
+            + "\n"
+        ).encode()
+        with path.open("ab") as fh:
+            fh.write(appended)
+
+        before = logs.bytes_read
+        polled = cf.run_events("growing", initial["total"], False, logs)
+        self.assertEqual(logs.bytes_read - before, len(appended))
+        self.assertEqual([event["text"] for event in polled["events"]], ["~ new"])
+
+        path.write_bytes(first)
+        before = logs.bytes_read
+        reread = cf.run_events("growing", 0, False, logs)
+        self.assertEqual(logs.bytes_read - before, len(first))
+        self.assertEqual(reread["total"], 1)
+
     def _write_outbox(self, name, messages):
         run = self.runs / name
         run.mkdir(parents=True, exist_ok=True)

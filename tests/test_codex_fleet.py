@@ -1842,6 +1842,40 @@ class SpawnWorktreeTests(FleetTempHome):
                 f"spawn creates {name} but the sweep does not protect it",
             )
 
+    def test_spawn_installs_husky_hook_shims_so_commit_hooks_fire(self):
+        """core.hooksPath=.husky/_ is gitignored and only husky creates it; a
+        worktree without it commits with NO hooks and reports green on lint
+        errors (2026-09-06). A stub husky bin stands in for the real one."""
+        root = self.temp_path / "repo"
+        root.mkdir()
+        self._git("init", "-q", "-b", "main", cwd=root)
+        (root / ".husky").mkdir()
+        (root / ".husky" / "pre-commit").write_text("#!/bin/sh\nexit 0\n")
+        (root / ".gitignore").write_text("node_modules\n.husky/_\n")
+        (root / "a.txt").write_text("x")
+        self._git("add", "-A", cwd=root)
+        self._git("commit", "-qm", "first", cwd=root)
+        husky_dir = root / "node_modules" / "husky"
+        husky_dir.mkdir(parents=True)
+        (husky_dir / "bin.js").write_text(
+            "require('fs').mkdirSync('.husky/_', {recursive: true});"
+            "require('fs').writeFileSync('.husky/_/h', '#!/bin/sh\\n');"
+        )
+
+        with mock.patch.object(cf, "ROOT", self.fleet_home):
+            wt, _branch, _root = cf.make_worktree("wthooks", str(root))
+        wt = Path(wt)
+        self.addCleanup(lambda: self._git("worktree", "remove", "--force", str(wt), cwd=root))
+
+        self.assertTrue((wt / ".husky" / "_" / "h").is_file(),
+                        "spawn must run husky so git finds the hook shims")
+
+    def test_install_git_hooks_is_a_no_op_without_husky(self):
+        wt = self.temp_path / "plain"
+        wt.mkdir()
+        cf.install_git_hooks(wt)  # no .husky, no node_modules: must not raise
+        self.assertFalse((wt / ".husky").exists())
+
 
 class CronInstallTests(unittest.TestCase):
     """install.sh writes to the user's crontab, so its failure modes are

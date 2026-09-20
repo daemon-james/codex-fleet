@@ -625,7 +625,32 @@ def make_worktree(name, base_cwd):
             shutil.copytree(src_dist, dest, symlinks=True)
         except OSError:
             pass
+
+    install_git_hooks(wt)
     return str(wt), branch, root
+
+
+def install_git_hooks(wt):
+    """Make the repo's commit hooks fire inside the worktree.
+
+    husky points core.hooksPath at the gitignored `.husky/_` shim directory,
+    which only `husky` (npm prepare) creates. A worktree provisioned by symlink
+    never ran prepare, so `.husky/_` was absent and git ran NO hooks: on
+    2026-09-06 an agent committed a file with ten eslint errors and reported
+    green, and the errors surfaced only at the owner's squash onto main. The
+    shim install is cheap and idempotent, so it runs on every spawn.
+    """
+    wt = Path(wt)
+    if not (wt / ".husky").is_dir():
+        return
+    bin_js = wt / "node_modules" / "husky" / "bin.js"
+    if not bin_js.is_file():
+        return
+    r = subprocess.run(
+        ["node", str(bin_js)], cwd=wt, capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        print(f"warning: husky install failed in {wt}: {r.stderr.strip()}", file=sys.stderr)
 
 
 def remove_worktree(meta):

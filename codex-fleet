@@ -577,8 +577,7 @@ def make_worktree(name, base_cwd):
 
     A fresh worktree has no node_modules, no .env, and no built dist. A
     read-only agent needs none of that. A writer that must RUN tests does, so
-    this links node_modules and copies .env when they exist, which covers the
-    common case without a full install.
+    this installs node_modules and copies .env when the project has them.
     """
     root = git_root(base_cwd)
     if not root:
@@ -595,13 +594,13 @@ def make_worktree(name, base_cwd):
     if r.returncode != 0:
         die(f"git worktree add failed: {r.stderr.strip()}")
 
-    # Link, do not copy: node_modules is large and the agent only reads it.
-    src_modules = Path(root) / "node_modules"
-    if src_modules.is_dir() and not (wt / "node_modules").exists():
-        try:
-            os.symlink(src_modules, wt / "node_modules")
-        except OSError:
-            pass
+    # Install, never link. Until 2026-09-13 this symlinked the main checkout's
+    # node_modules on the theory that agents only read it. Briefs tell agents
+    # to run `npm ci`, and `npm ci` empties the directory it is given before it
+    # installs; through a link, that directory was the owner's primary
+    # checkout. It was left empty mid-commit on 2026-09-12 and 2026-09-13. A
+    # real install costs about a minute per spawn.
+    install_dependencies(root, wt)
     for f in (".env", ".env.local"):
         src = Path(root) / f
         if src.is_file() and not (wt / f).exists():
@@ -626,24 +625,60 @@ def make_worktree(name, base_cwd):
         except OSError:
             pass
 
-    install_git_hooks(wt)
+    install_git_hooks(wt, root)
     return str(wt), branch, root
 
 
-def install_git_hooks(wt):
+def install_dependencies(root, wt):
+    """Give the worktree its own node_modules.
+
+    Runs `npm ci` when the project has a package-lock.json and the main
+    checkout has node_modules installed, so a spawn into a project nobody has
+    installed stays free. A failed install is a warning, not a stop: the agent
+    can install itself, and an absent node_modules is something it can see.
+    """
+    root, wt = Path(root), Path(wt)
+    if not (root / "package-lock.json").is_file():
+        return
+    if not (root / "node_modules").is_dir():
+        return
+    if (wt / "node_modules").exists():
+        return
+    npm = shutil.which("npm")
+    if not npm:
+        print(f"warning: npm not on PATH; {wt} has no node_modules", file=sys.stderr)
+        return
+    try:
+        r = subprocess.run(
+            [npm, "ci", "--no-audit", "--no-fund"],
+            cwd=wt, capture_output=True, text=True, timeout=900,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"warning: npm ci timed out in {wt}", file=sys.stderr)
+        return
+    if r.returncode != 0:
+        tail = r.stderr.strip().splitlines()[-5:]
+        print(f"warning: npm ci failed in {wt}: " + " | ".join(tail), file=sys.stderr)
+
+
+def install_git_hooks(wt, root=None):
     """Make the repo's commit hooks fire inside the worktree.
 
     husky points core.hooksPath at the gitignored `.husky/_` shim directory,
-    which only `husky` (npm prepare) creates. A worktree provisioned by symlink
-    never ran prepare, so `.husky/_` was absent and git ran NO hooks: on
-    2026-09-06 an agent committed a file with ten eslint errors and reported
-    green, and the errors surfaced only at the owner's squash onto main. The
-    shim install is cheap and idempotent, so it runs on every spawn.
+    which only `husky` (npm prepare) creates. Before spawn installed
+    dependencies, no prepare ever ran in a worktree, so `.husky/_` was absent
+    and git ran NO hooks: on 2026-09-06 an agent committed a file with ten
+    eslint errors and reported green, and the errors surfaced only at the
+    owner's squash onto main. `npm ci` runs prepare now; this stays as the
+    cheap, idempotent backstop, and falls back to the main checkout's husky
+    when the worktree has none.
     """
     wt = Path(wt)
     if not (wt / ".husky").is_dir():
         return
     bin_js = wt / "node_modules" / "husky" / "bin.js"
+    if not bin_js.is_file() and root:
+        bin_js = Path(root) / "node_modules" / "husky" / "bin.js"
     if not bin_js.is_file():
         return
     r = subprocess.run(
@@ -658,8 +693,9 @@ def remove_worktree(meta):
     root = meta.get("worktree_root")
     if not wt or not root:
         return None
-    # node_modules is a symlink into the main checkout. Remove the link first so
-    # nothing walks it and deletes the real one.
+    # Worktrees spawned before 2026-09-13 have node_modules as a symlink into
+    # the main checkout. Remove the link first so nothing walks it and deletes
+    # the real one.
     link = Path(wt) / "node_modules"
     if link.is_symlink():
         try:

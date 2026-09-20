@@ -1737,9 +1737,10 @@ class WorktreeSweepTests(FleetTempHome):
         self.assertEqual(skipped, ["build/big.bundle"])
 
     def test_the_node_modules_symlink_does_not_block_the_sweep(self):
-        """spawn links node_modules into every worktree and git ignores it.
-        Treating that as the agent's work would mean no worktree is ever swept
-        in any project with dependencies installed."""
+        """Worktrees spawned before 2026-09-13 link node_modules into the main
+        checkout, and git ignores it. Treating that as the agent's work would
+        mean no old worktree is ever swept in any project with dependencies
+        installed, and walking the link would delete the real one."""
         root = self._repo()
         (root / ".gitignore").write_text("node_modules\n")
         self._git("add", ".gitignore", cwd=root)
@@ -1815,11 +1816,30 @@ class SpawnWorktreeTests(FleetTempHome):
                  "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"},
         )
 
-    def test_spawn_copies_the_env_files_and_links_node_modules(self):
+    def test_spawn_copies_the_env_files_and_installs_node_modules(self):
+        """spawn used to symlink node_modules from the main checkout. `npm ci`
+        empties the directory it is given before installing, and through the
+        link that directory was the owner's primary checkout, which it left
+        empty mid-commit on 2026-09-12 and 2026-09-13. The worktree must get a
+        real directory of its own, and the main checkout's must be untouched."""
         root = self.temp_path / "repo"
         root.mkdir()
         self._git("init", "-q", "-b", "main", cwd=root)
         (root / "a.txt").write_text("x")
+        # One local dependency, so `npm ci` has something to write and needs
+        # no network. An empty lockfile creates no node_modules at all.
+        (root / "dep").mkdir()
+        (root / "dep" / "package.json").write_text('{"name": "dep", "version": "1.0.0"}\n')
+        (root / "package.json").write_text(
+            '{"name": "t", "version": "1.0.0", "dependencies": {"dep": "file:dep"}}\n'
+        )
+        (root / "package-lock.json").write_text(
+            '{"name": "t", "version": "1.0.0", "lockfileVersion": 3, "requires": true, '
+            '"packages": {'
+            '"": {"name": "t", "version": "1.0.0", "dependencies": {"dep": "file:dep"}}, '
+            '"dep": {"version": "1.0.0"}, '
+            '"node_modules/dep": {"resolved": "dep", "link": true}}}\n'
+        )
         self._git("add", "-A", cwd=root)
         self._git("commit", "-qm", "first", cwd=root)
         (root / ".env").write_text("SECRET=1\n")
@@ -1834,7 +1854,11 @@ class SpawnWorktreeTests(FleetTempHome):
 
         self.assertEqual((wt / ".env").read_text(), "SECRET=1\n")
         self.assertEqual((wt / ".env.local").read_text(), "LOCAL=1\n")
-        self.assertTrue((wt / "node_modules").is_symlink())
+        self.assertTrue((wt / "node_modules").is_dir(), "spawn must install")
+        self.assertFalse((wt / "node_modules").is_symlink(),
+                         "a link would let the agent's npm ci empty the main checkout")
+        self.assertTrue((root / "node_modules" / "dep.js").exists(),
+                        "the main checkout's node_modules must be untouched")
         self.assertEqual(resolved_root, str(root))
         for name in (".env", ".env.local", "node_modules"):
             self.assertTrue(
@@ -1845,7 +1869,9 @@ class SpawnWorktreeTests(FleetTempHome):
     def test_spawn_installs_husky_hook_shims_so_commit_hooks_fire(self):
         """core.hooksPath=.husky/_ is gitignored and only husky creates it; a
         worktree without it commits with NO hooks and reports green on lint
-        errors (2026-09-06). A stub husky bin stands in for the real one."""
+        errors (2026-09-06). A stub husky bin in the main checkout stands in
+        for the real one; with no lockfile, spawn installs nothing, so the
+        backstop must find husky in the main checkout."""
         root = self.temp_path / "repo"
         root.mkdir()
         self._git("init", "-q", "-b", "main", cwd=root)

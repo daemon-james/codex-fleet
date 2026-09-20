@@ -1816,6 +1816,146 @@ class SpawnWorktreeTests(FleetTempHome):
                  "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"},
         )
 
+    def test_requested_base_is_used_by_git_worktree_add(self):
+        root = self.temp_path / "repo"
+        root.mkdir()
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout="commit\n", stderr="")
+
+        provisioned = {"steps": [], "succeeded": True}
+        with mock.patch.object(cf, "git_root", return_value=str(root)), \
+             mock.patch.object(cf.Path, "home", return_value=self.temp_path), \
+             mock.patch.object(cf.subprocess, "run", side_effect=run), \
+             mock.patch.object(cf, "install_dependencies", return_value=provisioned), \
+             mock.patch.object(cf, "install_git_hooks"):
+            _wt, _branch, _root, result = cf.make_worktree(
+                "based", str(root), "feature/ready"
+            )
+
+        add = next(argv for argv in calls if "worktree" in argv)
+        self.assertEqual(add[-1], "feature/ready")
+        self.assertEqual(result, provisioned)
+
+    def test_unknown_base_is_refused_before_worktree_creation(self):
+        root = self.temp_path / "repo"
+        root.mkdir()
+        checked = []
+
+        def run(argv, **kwargs):
+            checked.append(argv)
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+
+        with mock.patch.object(cf, "git_root", return_value=str(root)), \
+             mock.patch.object(cf.Path, "home", return_value=self.temp_path), \
+             mock.patch.object(cf.subprocess, "run", side_effect=run), \
+             contextlib.redirect_stderr(io.StringIO()) as stderr, \
+             self.assertRaises(SystemExit):
+            cf.make_worktree("missing", str(root), "does-not-exist")
+
+        self.assertIn("unknown base ref 'does-not-exist'", stderr.getvalue())
+        self.assertFalse(any("worktree" in argv for argv in checked))
+        self.assertFalse((self.temp_path / ".codex-fleet" / "worktrees").exists())
+
+    def test_make_worktree_init_is_the_only_provisioning_when_target_exists(self):
+        root = self.temp_path / "repo"
+        wt = self.temp_path / "wt"
+        root.mkdir()
+        wt.mkdir()
+        (wt / "Makefile").write_text("worktree-init:\n\t@true\n")
+
+        with mock.patch.object(cf.shutil, "which", side_effect=lambda name: f"/bin/{name}"), \
+             mock.patch.object(cf.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            result = cf.install_dependencies(root, wt)
+
+        self.assertEqual(result, {"steps": ["make worktree-init"], "succeeded": True})
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], ["/bin/make", "worktree-init"])
+        self.assertEqual(run.call_args.kwargs["timeout"], 1800)
+
+    def test_fallback_provisions_dependencies_then_builds_workspaces(self):
+        root = self.temp_path / "repo"
+        wt = self.temp_path / "wt"
+        root.mkdir()
+        wt.mkdir()
+        (wt / "package-lock.json").write_text("{}\n")
+        (wt / "package.json").write_text('{"workspaces": ["packages/*"]}\n')
+
+        with mock.patch.object(cf.shutil, "which", return_value="/bin/npm"), \
+             mock.patch.object(cf.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            result = cf.install_dependencies(root, wt)
+
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list],
+            [
+                ["/bin/npm", "ci", "--no-audit", "--no-fund"],
+                ["/bin/npm", "run", "build", "--workspaces", "--if-present"],
+            ],
+        )
+        self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list], [900, 1800])
+        self.assertEqual(
+            result,
+            {
+                "steps": ["npm ci", "npm run build --workspaces --if-present"],
+                "succeeded": True,
+            },
+        )
+
+    def test_failed_provisioning_is_recorded_and_marked_in_list(self):
+        wt = self.temp_path / "wt"
+        provisioned = {"steps": ["make worktree-init"], "succeeded": False}
+
+        def launch(name, meta, prompt):
+            meta["pid"] = None
+            meta["turns"] = 1
+            cf.save_meta(name, meta)
+            events = self.runs / name / "turn-1.jsonl"
+            events.write_text('{"type":"turn.failed"}\n')
+            return None, events
+
+        argv = [
+            "codex-fleet", "spawn", "task", "-n", "broken", "-C", str(self.temp_path),
+            "-w", "--base", "feature/ready", "--no-prune",
+        ]
+        with mock.patch.object(sys, "argv", argv), \
+             mock.patch.object(cf.shutil, "which", return_value="codex"), \
+             mock.patch.object(
+                 cf, "make_worktree",
+                 return_value=(str(wt), "fleet/broken", str(self.temp_path), provisioned),
+             ), \
+             mock.patch.object(cf, "launch", side_effect=launch), \
+             mock.patch.object(cf, "await_thread_id", return_value="thread-test"), \
+             contextlib.redirect_stdout(io.StringIO()):
+            cf.main()
+
+        meta = cf.load_meta("broken")
+        self.assertEqual(meta["worktree_base"], "feature/ready")
+        self.assertEqual(meta["provisioning"], provisioned)
+        listed = io.StringIO()
+        with contextlib.redirect_stdout(listed):
+            cf.cmd_list(argparse.Namespace())
+        self.assertIn("fleet/broken from feature/ready", listed.getvalue())
+        self.assertIn("PROVISIONING FAILED", listed.getvalue())
+
+    def test_failed_step_names_itself_in_the_warning(self):
+        root = self.temp_path / "repo"
+        wt = self.temp_path / "wt"
+        root.mkdir()
+        wt.mkdir()
+        (wt / "Makefile").write_text("worktree-init:\n\t@false\n")
+        failed = subprocess.CompletedProcess([], 2, "", "build broke\n")
+
+        warning = io.StringIO()
+        with mock.patch.object(cf.shutil, "which", return_value="/bin/make"), \
+             mock.patch.object(cf.subprocess, "run", return_value=failed), \
+             contextlib.redirect_stderr(warning):
+            result = cf.install_dependencies(root, wt)
+
+        self.assertFalse(result["succeeded"])
+        self.assertIn("make worktree-init failed", warning.getvalue())
+
     def test_spawn_copies_the_env_files_and_installs_node_modules(self):
         """spawn used to symlink node_modules from the main checkout. `npm ci`
         empties the directory it is given before installing, and through the
@@ -1847,8 +1987,9 @@ class SpawnWorktreeTests(FleetTempHome):
         (root / "node_modules").mkdir()
         (root / "node_modules" / "dep.js").write_text("//")
 
-        with mock.patch.object(cf, "ROOT", self.fleet_home):
-            wt, branch, resolved_root = cf.make_worktree("wtest", str(root))
+        with mock.patch.object(cf, "ROOT", self.fleet_home), \
+             mock.patch.object(cf.Path, "home", return_value=self.temp_path):
+            wt, branch, resolved_root, _provisioned = cf.make_worktree("wtest", str(root))
         wt = Path(wt)
         self.addCleanup(lambda: self._git("worktree", "remove", "--force", str(wt), cwd=root))
 
@@ -1888,8 +2029,9 @@ class SpawnWorktreeTests(FleetTempHome):
             "require('fs').writeFileSync('.husky/_/h', '#!/bin/sh\\n');"
         )
 
-        with mock.patch.object(cf, "ROOT", self.fleet_home):
-            wt, _branch, _root = cf.make_worktree("wthooks", str(root))
+        with mock.patch.object(cf, "ROOT", self.fleet_home), \
+             mock.patch.object(cf.Path, "home", return_value=self.temp_path):
+            wt, _branch, _root, _provisioned = cf.make_worktree("wthooks", str(root))
         wt = Path(wt)
         self.addCleanup(lambda: self._git("worktree", "remove", "--force", str(wt), cwd=root))
 

@@ -67,7 +67,15 @@ Without the inbox hook, messages queue but do not reach running agents.
 codex-fleet list
 codex-fleet tell scout "Focus on the deployment scripts."
 codex-fleet say scout "Explain the main entry point." # follow up after it finishes
+codex-fleet spawn "Implement the feature." -n builder -C /path/to/repo -w --base feature/ready
 ```
+
+`spawn -w` normally branches from the `-C` checkout's `HEAD`; `--base <ref>`
+starts it from another local Git ref. Worktrees use `make worktree-init` when
+the repository provides that target. Otherwise Fleet runs its npm install and,
+for npm workspaces, the workspace build. Provisioning failures leave the
+worktree available, print a warning, and appear as `PROVISIONING FAILED` in
+`codex-fleet list`.
 
 This first release publishes the existing implementation. Linux-specific
 process inspection and socket locking need porting before macOS or native

@@ -569,7 +569,7 @@ def git_root(path):
     return r.stdout.strip() if r.returncode == 0 else None
 
 
-def make_worktree(name, base_cwd):
+def make_worktree(name, base_cwd, base="HEAD"):
     """Give one agent its own checkout so concurrent writers cannot collide.
 
     Two agents in one tree collide; the only question is whether you notice.
@@ -582,13 +582,19 @@ def make_worktree(name, base_cwd):
     root = git_root(base_cwd)
     if not root:
         die(f"--worktree needs a git repository; {base_cwd} is not in one")
+    resolved = subprocess.run(
+        ["git", "-C", root, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}"],
+        capture_output=True, text=True,
+    )
+    if resolved.returncode != 0:
+        die(f"unknown base ref {base!r} in {root}", 2)
     wt = Path.home() / ".codex-fleet" / "worktrees" / name
     if wt.exists():
         die(f"worktree already exists at {wt}; pick another name or codex-fleet rm {name}")
     wt.parent.mkdir(parents=True, exist_ok=True)
     branch = f"fleet/{name}"
     r = subprocess.run(
-        ["git", "-C", root, "worktree", "add", "-b", branch, str(wt), "HEAD"],
+        ["git", "-C", root, "worktree", "add", "-b", branch, str(wt), base],
         capture_output=True, text=True,
     )
     if r.returncode != 0:
@@ -600,7 +606,7 @@ def make_worktree(name, base_cwd):
     # installs; through a link, that directory was the owner's primary
     # checkout. It was left empty mid-commit on 2026-09-12 and 2026-09-13. A
     # real install costs about a minute per spawn.
-    install_dependencies(root, wt)
+    provisioning = install_dependencies(root, wt)
     for f in (".env", ".env.local"):
         src = Path(root) / f
         if src.is_file() and not (wt / f).exists():
@@ -626,39 +632,72 @@ def make_worktree(name, base_cwd):
             pass
 
     install_git_hooks(wt, root)
-    return str(wt), branch, root
+    return str(wt), branch, root, provisioning
+
+
+def run_provisioning_step(program, args, label, wt, timeout):
+    command = shutil.which(program)
+    if not command:
+        print(f"warning: {label} could not run in {wt}: {program} not on PATH", file=sys.stderr)
+        return False
+    try:
+        r = subprocess.run(
+            [command, *args], cwd=wt, capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"warning: {label} timed out in {wt}", file=sys.stderr)
+        return False
+    except OSError as exc:
+        print(f"warning: {label} could not run in {wt}: {exc}", file=sys.stderr)
+        return False
+    if r.returncode == 0:
+        return True
+    tail = (r.stderr or r.stdout).strip().splitlines()[-5:]
+    detail = f": {' | '.join(tail)}" if tail else ""
+    print(f"warning: {label} failed in {wt}{detail}", file=sys.stderr)
+    return False
 
 
 def install_dependencies(root, wt):
-    """Give the worktree its own node_modules.
+    """Provision dependencies and generated workspace output in the worktree.
 
-    Runs `npm ci` when the project has a package-lock.json and the main
-    checkout has node_modules installed, so a spawn into a project nobody has
-    installed stays free. A failed install is a warning, not a stop: the agent
-    can install itself, and an absent node_modules is something it can see.
+    Prefer the repository's worktree-init target. Otherwise retain the npm ci
+    path and build declared npm workspaces. Every attempted step is recorded,
+    and failures warn without discarding the worktree.
     """
     root, wt = Path(root), Path(wt)
-    if not (root / "package-lock.json").is_file():
-        return
-    if not (root / "node_modules").is_dir():
-        return
-    if (wt / "node_modules").exists():
-        return
-    npm = shutil.which("npm")
-    if not npm:
-        print(f"warning: npm not on PATH; {wt} has no node_modules", file=sys.stderr)
-        return
+    makefile = wt / "Makefile"
+    if makefile.is_file() and re.search(
+        r"(?m)^[ \t]*worktree-init[ \t]*:(?!=)", makefile.read_text(errors="ignore")
+    ):
+        step = "make worktree-init"
+        return {
+            "steps": [step],
+            "succeeded": run_provisioning_step(
+                "make", ["worktree-init"], step, wt, timeout=1800
+            ),
+        }
+
+    commands = []
+    if (wt / "package-lock.json").is_file() and not (wt / "node_modules").exists():
+        commands.append(("npm ci", ["ci", "--no-audit", "--no-fund"], 900))
+    package = wt / "package.json"
     try:
-        r = subprocess.run(
-            [npm, "ci", "--no-audit", "--no-fund"],
-            cwd=wt, capture_output=True, text=True, timeout=900,
-        )
-    except subprocess.TimeoutExpired:
-        print(f"warning: npm ci timed out in {wt}", file=sys.stderr)
-        return
-    if r.returncode != 0:
-        tail = r.stderr.strip().splitlines()[-5:]
-        print(f"warning: npm ci failed in {wt}: " + " | ".join(tail), file=sys.stderr)
+        has_workspaces = "workspaces" in json.loads(package.read_text())
+    except (OSError, json.JSONDecodeError, TypeError):
+        has_workspaces = False
+    if has_workspaces:
+        commands.append((
+            "npm run build --workspaces --if-present",
+            ["run", "build", "--workspaces", "--if-present"],
+            1800,
+        ))
+
+    results = [
+        run_provisioning_step("npm", args, label, wt, timeout)
+        for label, args, timeout in commands
+    ]
+    return {"steps": [label for label, _args, _timeout in commands], "succeeded": all(results)}
 
 
 def install_git_hooks(wt, root=None):
@@ -748,6 +787,9 @@ def cmd_spawn(args):
     effort = resolve_effort(args.role, args.effort)
     if not shutil.which("codex"):
         die("codex CLI not found on PATH")
+    base_arg = getattr(args, "base", None)
+    if base_arg and not getattr(args, "worktree", False):
+        die("--base requires --worktree", 2)
     name = args.name or slug(args.prompt)
     if run_dir(name).exists() and not args.force:
         n = 2
@@ -755,14 +797,18 @@ def cmd_spawn(args):
             n += 1
         name = f"{name}-{n}"
     d = run_dir(name)
+    work_cwd = str(Path(args.cd).resolve())
+    worktree = worktree_branch = worktree_root = None
+    worktree_base = base_arg or "HEAD"
+    provisioning = {"steps": [], "succeeded": True}
+    if getattr(args, "worktree", False):
+        worktree, worktree_branch, worktree_root, provisioning = make_worktree(
+            name, work_cwd, worktree_base
+        )
+        work_cwd = worktree
     if args.force and d.exists():
         shutil.rmtree(d)
     d.mkdir(parents=True, exist_ok=True)
-    work_cwd = str(Path(args.cd).resolve())
-    worktree = worktree_branch = worktree_root = None
-    if getattr(args, "worktree", False):
-        worktree, worktree_branch, worktree_root = make_worktree(name, work_cwd)
-        work_cwd = worktree
     meta = {
         "name": name,
         "role": args.role,
@@ -779,6 +825,8 @@ def cmd_spawn(args):
         "worktree": worktree,
         "worktree_branch": worktree_branch,
         "worktree_root": worktree_root,
+        "worktree_base": worktree_base if worktree else None,
+        "provisioning": provisioning if worktree else None,
         "config": args.config or [],
         "output_schema": str(Path(args.output_schema).resolve()) if args.output_schema else None,
         "created_at": now(),
@@ -795,7 +843,7 @@ def cmd_spawn(args):
     print(f"  thread {thread_id or paint('(not yet reported)', 'yellow')}")
     print(f"  events {events_path}")
     if worktree:
-        print(f"  worktree {worktree}  branch {worktree_branch}")
+        print(f"  worktree {worktree}  branch {worktree_branch} from {worktree_base}")
     # Spawning is the moment new disk gets allocated, so it is the right moment
     # to collapse the old. Silent unless it actually frees something, and it
     # never touches a running agent or a run with a worktree still on disk.
@@ -833,10 +881,18 @@ def cmd_list(args):
         )
         role = meta.get("role", "-")
         foreign = "" if owned_here(meta) else paint("  [other session]", "dim")
+        worktree = ""
+        if meta.get("worktree_branch"):
+            worktree = (
+                f"  [{meta['worktree_branch']} from {meta.get('worktree_base') or 'HEAD'}]"
+            )
+        if (meta.get("provisioning") or {}).get("succeeded") is False:
+            worktree += paint("  [PROVISIONING FAILED]", "red")
         print(
             f"{name:<24} {paint(f'{st:<9}', colour)} {role:<17} {meta['model']:<15} {meta['effort']:<7} "
             f"{meta.get('turns', 0):<6} {render_output_tokens(events, meta):<9} "
-            f"{mcp_text(latest_events, meta):<9} {age(latest, meta):<5} {msg}{foreign}"
+            f"{mcp_text(latest_events, meta):<9} {age(latest, meta):<5} "
+            f"{msg}{foreign}{worktree}"
         )
 
 
@@ -2958,6 +3014,9 @@ def main():
         "--worktree", "-w", action="store_true",
         help="run in a dedicated git worktree on branch fleet/<name>. Use whenever "
              "two or more writers run at once: git enforces the split, a brief does not",
+    )
+    sp.add_argument(
+        "--base", help="create the worktree from this git ref instead of the -C checkout's HEAD",
     )
     sp.add_argument("--config", "-c", action="append", help="extra -c key=value passed to codex")
     sp.add_argument("--output-schema", help="JSON Schema file for the final response")

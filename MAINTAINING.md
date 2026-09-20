@@ -177,34 +177,26 @@ stop and can never loop. Runs that predate `result_read_turn` are exempt,
 because 44 historical runs tripped the first dry run and a run nobody recorded
 reading cannot be proven unread.
 
-**Do not sandbox the agents tighter than the user's own config.** This machine's
-`~/.codex/config.toml` sets `sandbox_mode = "danger-full-access"` and
-`approval_policy = "never"`, and the models are frontier coders on the user's own
-hardware. `codex-fleet` used to force `workspace-write` on every spawn and stamp
-`-c sandbox_mode` over the user config on every resume. That single override
-caused every wall hit on 2026-08-22: `git add` could not write the shared object
-database in a worktree, `node net.listen` could not bind, and EVERY MCP call
-failed with `MCP tool call requires approval, but approval policy is never`.
+**MCP access on resume must be tested, not inferred from the approval policy.**
+With Codex CLI 0.155.1, a real Fleet spawn followed by `say` on the same thread
+both completed an MCP tool call with the existing launch settings. An older
+`KNOWN LIMITATION` claiming every resume loses MCP access under the `never`
+approval policy was obsolete and has been removed. Do not change approval
+settings merely to match that comment.
 
-Three agents lost turns to it and the orchestrator lost an afternoon, twice
-concluding the cause was something else. The default is now `danger-full-access`,
-and a resume only narrows the sandbox when that run explicitly asked to be
-narrowed. `-C` still confines the working directory, which is what makes a
-worktree an isolated place to work; the sandbox on top of it bought nothing.
+When agents report missing MCP tools, check authentication first. Reports of
+that kind have turned out to be OAuth refresh rejections (`invalid_grant`,
+`invalid_token`) recorded in `turn-*.err`, on fresh spawns as well as resumes.
+Fleet cannot repair server-rejected credentials by changing resume flags.
+Authentication must work before the Codex process starts; a successful sign-in
+elsewhere does not restore an already failed MCP connection in a running turn.
 
-`read-only` and `workspace-write` remain, for when narrowing is a deliberate
-choice, such as a reviewer that must not be able to edit what it reviews. Know
-what each costs before choosing it: under `read-only` an agent cannot write to
-its own run directory, so `codex-fleet ask` cannot reach you either.
-
-**Read the event log, not the agent's prose, when a capability looks broken.**
-The failures above were plain in `turn-*.jsonl` the whole time: ten resumed turns
-each carrying `mcp_tool_call ... status: failed ... "requires approval, but
-approval policy is never"`. The orchestrator instead believed an agent that
-reported `TypeError: ... is not a function`, which was Code Mode failing on a
-script the agent wrote rather than an MCP call it made, and spent hours on the
-wrong diagnosis. An agent reporting a capability as absent is reporting what it
-tried.
+**Read the event log and stderr when a capability looks broken.**
+`turn-*.jsonl` distinguishes an actual failed `mcp_tool_call` from an agent's
+claim that tools are absent. `turn-*.err` records MCP startup/authentication
+failures that can leave no callable tool at all. A Code Mode `TypeError` is not
+an MCP approval failure. Use a real spawn followed by a real `say`, request an
+explicit MCP call, and inspect the call's status and error in both logs.
 
 **A worktree is branched at spawn and never moves on its own.** Resume a
 reviewer three commits later and it reads the files it was born with while being

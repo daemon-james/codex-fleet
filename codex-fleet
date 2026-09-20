@@ -444,18 +444,9 @@ def build_cmd(meta, prompt, resume_id=None):
     cmd += ["--json", "-m", meta["model"], "-c", f"model_reasoning_effort={meta['effort']}"]
     if resume_id:
         cmd += ["-c", 'sandbox_mode="danger-full-access"']
-        # KNOWN LIMITATION, do not "fix" this without testing a real resume.
-        # resume rejects --approve-for-me, so a resumed agent falls back to the
-        # user's approval_policy ("never") and every MCP call dies with "MCP
-        # tool call requires approval, but approval policy is never". Proven
-        # 2026-08-21: one agent answered "Succeeded." on its spawn turn and hit
-        # that error on its resume turn.
-        # approval_policy="granular" is NOT the answer. It parses on spawn but
-        # resume rejects it with "invalid type: unit variant, expected newtype
-        # variant", so it wants a value rather than a bare string. Tried and
-        # reverted rather than shipped broken.
-        # Until the right key is found: tell a resumed agent to put findings in
-        # its final message, and checkpoint on its behalf.
+        # Verified with Codex 0.155.1: spawn and resume both call MCP with
+        # these settings. Missing tools can instead mean MCP startup failed;
+        # inspect turn-N.err (OAuth invalid_grant/invalid_token), not just prose.
     else:
         cmd += ["-s", "danger-full-access", "-C", meta["cwd"]]
     # The run directory is the agent's only way to speak back mid-turn. Without

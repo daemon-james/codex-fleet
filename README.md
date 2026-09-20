@@ -209,6 +209,12 @@ filter and reported every run on the machine into every session. Size and
 timestamp are not enough on their own: an edit that keeps the same length and
 puts the timestamp back leaves both unchanged.
 
+Monitor hosts may stop the stream after 30 minutes; restart `codex-fleet events`
+with the same session identity. Its run/turn/stall snapshot survives restarts,
+so only changes and still-unanswered questions are shown. `tell` retires both
+blocking and nonblocking questions; answered questions never replay. `--all`
+keeps a separate snapshot for the machine-wide view.
+
 ## Session ownership
 
 Two orchestrator sessions can run fleets on one machine without talking over

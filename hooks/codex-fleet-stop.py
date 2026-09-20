@@ -92,9 +92,9 @@ def main():
         names = " ".join(sorted(loose))
         lines.append(
             f"{len(loose)} fleet agent(s) are running and nothing will wake you when they "
-            f"finish: {names}. Arm the fleet connection once for this session: "
-            f'Monitor({{ command: "codex-fleet events", persistent: true, description: "codex fleet" }}). '
-            f"Every fleet event then reaches you as a notification, idle or not, with nothing to re-arm."
+            f"finish: {names}. Arm the fleet connection for this session: "
+            f'Monitor({{ command: "codex-fleet events", description: "codex fleet" }}). '
+            f"Every fleet event reaches you as a notification. Restart the monitor when it expires."
         )
     if unread:
         names = " ".join(sorted(unread))

@@ -143,7 +143,7 @@ def drain_outbox(name):
             rewritten.append(ln)
             continue
         blocking_unanswered = msg.get("blocking") and not msg.get("answered")
-        if not msg.get("read") or blocking_unanswered:
+        if (not msg.get("read") and not msg.get("answered")) or blocking_unanswered:
             unread.append(msg)
             msg["read"] = True
             changed = True
@@ -216,9 +216,9 @@ def same_fleet_home(pid):
 
 
 def events_monitor_armed():
-    """True when a persistent `codex-fleet events` Monitor is running for this
+    """True when a `codex-fleet events` Monitor is running for this
     Claude session. That is the inbound half of the fleet connection: every
-    line it prints wakes the orchestrator, idle or not, with nothing to re-arm.
+    line it prints wakes the orchestrator, idle or not. Re-arm after a timeout.
     """
     return bool(observed_pids("events"))
 
@@ -338,7 +338,7 @@ def main():
     if event == "UserPromptSubmit" and session not in reminded and not events_monitor_armed():
         monitor_reminder = (
             "codex-fleet: no events monitor armed; arm with "
-            "Monitor({command:'codex-fleet events', persistent:true})"
+            "Monitor({command:'codex-fleet events'})"
         )
         reminded.add(session)
     for name, run in runs.items():
@@ -385,8 +385,8 @@ def main():
             names = " ".join(sorted(loose))
             nag.append(
                 f"{len(loose)} agent(s) running and nothing will wake you when they finish: {names}."
-                f" Arm the fleet connection once for this session, then forget about it:"
-                f' Monitor({{ command: "codex-fleet events", persistent: true, description: "codex fleet" }})'
+                f" Arm the fleet connection; restart it when the monitor expires:"
+                f' Monitor({{ command: "codex-fleet events", description: "codex fleet" }})'
             )
             seen["_unwatched_at"] = time.time()
 

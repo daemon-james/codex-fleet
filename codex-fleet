@@ -1075,7 +1075,7 @@ def warn_if_orphaned():
     shell `&`, it is reparented to PID 1 when its shell exits, returns on the
     first completion, and nothing is notified. Three dropped threads on
     2026-08-22 had exactly that shape. Orchestration should not use wait at
-    all now: arm `codex-fleet events` once as a persistent Monitor instead.
+    all now: use `codex-fleet events` and restart it after monitor timeouts.
     """
     pid = os.getpid()
     seen = 0
@@ -1093,8 +1093,8 @@ def warn_if_orphaned():
     print(
         paint(
             "  this wait has no claude ancestor, so nothing will be woken when it returns.\n"
-            "  From Claude Code, arm the fleet connection once instead:\n"
-            '  Monitor({ command: "codex-fleet events", persistent: true, description: "codex fleet" })',
+            "  From Claude Code, arm the fleet connection instead:\n"
+            '  Monitor({ command: "codex-fleet events", description: "codex fleet" })',
             "yellow",
         ),
         file=sys.stderr,
@@ -1168,12 +1168,10 @@ def cmd_tell(args):
     inbox = d / "inbox.jsonl"
     with open(inbox, "a", encoding="utf-8") as fh:
         fh.write(json.dumps({"text": args.message, "at": now(), "read": False}) + "\n")
-    # Reaching the agent IS the answer, so it retires that agent's outstanding
-    # blocking questions. Nothing else clears them: reading one does not stop
-    # the agent waiting on it.
-    answered = mark_blocking_answered(args.name)
+    # A reply retires outstanding questions, including non-blocking ones.
+    answered = mark_questions_answered(args.name)
     if answered:
-        print(f"{args.name}: {answered} blocking question(s) marked answered")
+        print(f"{args.name}: {answered} question(s) marked answered")
     state = status_of(args.name, meta)
     where = "on its next tool call" if state == "running" else "when it next runs"
     print(f"queued for {args.name} ({state}); delivered {where}")
@@ -1203,6 +1201,7 @@ def cmd_ask(args):
             "at": now(),
             "blocking": bool(args.blocking),
             "read": False,
+            "answered": False,
         }) + "\n")
     if args.blocking:
         print("raised as BLOCKING. Keep working on anything that does not depend "
@@ -1211,8 +1210,8 @@ def cmd_ask(args):
         print("raised. Keep working; a reply will reach you on a later tool call.")
 
 
-def mark_blocking_answered(name):
-    """Retire an agent's outstanding blocking questions. Returns how many.
+def mark_questions_answered(name):
+    """Retire an agent's outstanding questions. Returns how many.
 
     Called by `tell`, because reaching the agent is the only thing that actually
     answers it. Reading a question does not.
@@ -1231,8 +1230,9 @@ def mark_blocking_answered(name):
         except ValueError:
             rewritten.append(ln)
             continue
-        if msg.get("blocking") and not msg.get("answered"):
+        if not msg.get("answered"):
             msg["answered"] = True
+            msg["read"] = True
             count += 1
         rewritten.append(json.dumps(msg))
     if count:
@@ -1259,6 +1259,12 @@ def all_questions(name):
                 continue
     except OSError:
         return []
+    # Older tell versions marked only blocking questions. The retained inbox
+    # proves which earlier questions already received a reply, even after read.
+    replied_at = max((m.get("at", "") for m in read_events(run_dir(name) / "inbox.jsonl")), default="")
+    for msg in out:
+        if "answered" not in msg and msg.get("at") and msg["at"] <= replied_at:
+            msg["answered"] = True
     return out
 
 
@@ -1320,7 +1326,7 @@ def read_outbox(
         blocking_unanswered = msg.get("blocking") and not msg.get("answered")
         if (
             include_read
-            or not msg.get("read")
+            or (not msg.get("read") and not msg.get("answered"))
             or (include_unanswered_blocking and blocking_unanswered)
         ):
             unread.append(msg)
@@ -1460,23 +1466,9 @@ EVENTS_STALL_BUCKETS = (600, 1800, 3600)
 def cmd_events(args):
     """One line per fleet event, forever. The inbound half of the connection.
 
-    Arm it ONCE per orchestrator session as a persistent Monitor:
-
-        Monitor({ command: "codex-fleet events", persistent: true,
-                  description: "codex fleet" })
-
-    Every line it prints becomes a notification that reaches the orchestrator
-    whether it is idle or mid-turn, so nothing has to be re-armed and no
-    command has to be remembered after the first one. `wait` is for humans and
-    scripts; orchestration does not need it once this is running.
-
-    Events: started, finished (with the first line of the result and the
-    command to read it), FAILED, stopped, ASKING (a blocking question, once per
-    question), stalled (no event for 10/30/60 minutes, once per bucket). On
-    start it prints one line per run that is running, so a fresh session knows
-    the state it inherited.
-
-    Lines are flushed individually; a poll that fails is skipped, never fatal.
+    Restart after the host's monitor timeout. Run/turn/stall state survives
+    restarts per session and view; unanswered questions are shown again.
+    Lines are flushed individually; a bad run is retried on the next poll.
     """
     owner = current_owner()
     holder = claim_events_lock(owner)
@@ -1487,7 +1479,15 @@ def cmd_events(args):
         return
     fingerprint = script_fingerprint()
 
-    seen = {}
+    state_path = ROOT / (events_lock_name(owner)[1:] +
+                         ("-all" if getattr(args, "all", False) else "") + ".json")
+    try:
+        seen = json.loads(state_path.read_text())
+        if not isinstance(seen, dict):
+            raise ValueError("invalid events state")
+        restarting = True
+    except (OSError, ValueError):
+        seen, restarting = {}, False
     asked = set()
     first = True
     try:
@@ -1502,16 +1502,24 @@ def cmd_events(args):
                         continue
                     st = status_of(name, meta)
                     prev = seen.get(name)
+                    run_id = [meta.get("created_at"), meta.get("thread_id")]
+                    # Spawn writes thread_id shortly after launch. Filling it in
+                    # is not a second start of the same run.
+                    if prev and prev.get("run") not in (run_id, [run_id[0], None]):
+                        prev = None
+                    turn = meta.get("turns", 1)
+                    new_turn = prev and prev.get("turn") != turn
                     latest = run_dir(name) / f"turn-{meta.get('turns', 1)}.jsonl"
                     quiet = time.time() - (mtime(latest, meta) or time.time())
                     role = meta.get("role", "?")
 
-                    if first:
-                        if st == "running":
-                            print(f"running {name} ({role}), {int(quiet // 60)}m since last event", flush=True)
-                    elif prev is None and st == "running":
-                        print(f"started {name} ({role})", flush=True)
-                    elif prev and prev["status"] == "running" and st != "running":
+                    if st == "running" and (prev is None or new_turn or prev["status"] != "running"):
+                        verb = "running" if first and not restarting else "started"
+                        print(f"{verb} {name} ({role})", flush=True)
+                    elif st != "running" and (
+                        (prev and (prev["status"] == "running" or new_turn))
+                        or (prev is None and (restarting or not first))
+                    ):
                         verb = {"idle": "finished", "failed": "FAILED", "stopped": "stopped without completing"}.get(st, st)
                         latest_events = read_events(latest)
                         msg = last_message(latest_events, name).replace("\n", " ")[:160]
@@ -1527,17 +1535,11 @@ def cmd_events(args):
                     # blocking ones the orchestrator never saw it. That happened on
                     # 2026-08-22: an engineer asked whether to change a hook
                     # package, got no answer, and shipped without it.
-                    for q in all_questions(name):
-                        key = (name, q.get("at"))
-                        if key in asked:
+                    for index, q in enumerate(all_questions(name)):
+                        key = (name, run_id[0], index, q.get("at"))
+                        if q.get("answered") or key in asked:
                             continue
                         asked.add(key)
-                        # On the first pass a fresh monitor has no memory of what
-                        # was already shown. Questions from finished runs, and
-                        # answered ones, are history, not events; replaying them
-                        # on every restart buried the live ones.
-                        if first and (st != "running" or q.get("answered")):
-                            continue
                         kind = "ASKING (blocking)" if q.get("blocking") else "asks"
                         blocking = str(bool(q.get("blocking"))).lower()
                         print(
@@ -1556,8 +1558,12 @@ def cmd_events(args):
                             f"stalled {name} ({role}): no event for {bucket // 60} minutes  ->  codex-fleet tail {name} -n 15, or kill it",
                             flush=True,
                         )
-                    seen[name] = {"status": st, "stall": bucket if st == "running" else 0}
+                    seen[name] = {"run": run_id, "turn": turn, "status": st, "stall": bucket}
                 first = False
+                # Save during polling, not at exit: the monitor may be SIGKILLed.
+                tmp = state_path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(seen))
+                os.replace(tmp, state_path)
             except Exception:
                 # A bad poll is skipped. The stream must outlive any single error.
                 pass
@@ -1583,7 +1589,9 @@ def cmd_inbox(args):
         )
         for m in msgs:
             found = True
-            if m.get("blocking"):
+            if m.get("answered"):
+                flag = "answered"
+            elif m.get("blocking"):
                 flag = paint("BLOCKING, unanswered", "red")
             else:
                 flag = "asks"
@@ -1591,7 +1599,7 @@ def cmd_inbox(args):
                 flag += ", read"
             print(f"{paint(name, 'bold')} {flag} [{m.get('at','')}]")
             print(f"  {m.get('text','')}")
-            if m.get("blocking"):
+            if m.get("blocking") and not m.get("answered"):
                 print(f'  answer it: codex-fleet tell {name} "<answer>"')
     if not found:
         print("nothing raised")
@@ -3069,7 +3077,7 @@ def main():
     akp.add_argument("--blocking", action="store_true", help="the work cannot finish without an answer")
     akp.set_defaults(func=cmd_ask)
 
-    ev = sub.add_parser("events", help="one line per fleet event, forever; arm once as a persistent Monitor")
+    ev = sub.add_parser("events", help="one line per fleet event, forever; restartable stream for the session")
     ev.add_argument("--all", action="store_true", help="include runs owned by other sessions")
     ev.set_defaults(func=cmd_events)
     ibp = sub.add_parser("inbox", help="show questions agents have raised")

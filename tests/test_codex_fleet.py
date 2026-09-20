@@ -601,6 +601,104 @@ time.sleep(30)
         )
         return run / "outbox.jsonl"
 
+    def _poll_events(self, owner="session-a", all_runs=False, between_polls=None):
+        output = io.StringIO()
+        sleeps = [between_polls, None] if between_polls else [None]
+        def sleep(_seconds):
+            action = sleeps.pop(0)
+            if action:
+                action()
+            else:
+                raise KeyboardInterrupt
+        with mock.patch.object(cf, "current_owner", return_value=owner), \
+             mock.patch.object(cf.time, "sleep", side_effect=sleep), \
+             contextlib.redirect_stdout(output), contextlib.suppress(KeyboardInterrupt):
+            cf.cmd_events(argparse.Namespace(all=all_runs))
+        return output.getvalue()
+
+    def test_events_restart_keeps_run_turn_and_stall_state(self):
+        run, meta = self._make_run("worker", pid=os.getpid(), log_mtimes=[self.clock - 700])
+        first = self._poll_events()
+        self.assertIn("running worker", first)
+        self.assertIn("stalled worker", first)
+        self.assertEqual(self._poll_events(), "")
+        # Finishing while the monitor is dead is still a new event.
+        meta["pid"] = None
+        self._write_meta("worker", meta)
+        self._write_jsonl(run / "turn-1.jsonl", [{"type": "turn.completed"}])
+        self.assertIn("finished worker", self._poll_events())
+        self.assertEqual(self._poll_events(), "")
+        # A whole resumed turn can start and finish between monitor polls.
+        meta["turns"] = 2
+        self._write_meta("worker", meta)
+        self._write_jsonl(run / "turn-2.jsonl", [{"type": "turn.completed"}])
+        self.assertIn("finished worker", self._poll_events())
+        self.assertEqual(self._poll_events(), "")
+
+        meta["turns"], meta["pid"] = 3, os.getpid()
+        self._write_meta("worker", meta)
+        self._write_jsonl(run / "turn-3.jsonl", [])
+        self.assertIn("started worker", self._poll_events())
+        self.assertEqual(self._poll_events(), "")
+
+    def test_events_state_is_scoped_by_owner_and_all_view_and_run_identity(self):
+        _run, meta = self._make_run("worker", pid=os.getpid(), meta_updates={"owner": "session-a", "thread_id": None})
+        self.assertIn("running worker", self._poll_events())
+        meta["thread_id"] = "thread-worker"
+        self._write_meta("worker", meta)
+        self.assertEqual(self._poll_events(), "")
+        self.assertEqual(self._poll_events(owner="session-b"), "")
+        self.assertIn("running worker", self._poll_events(owner="session-b", all_runs=True))
+        self.assertEqual(self._poll_events(), "")
+        meta["thread_id"] = "replacement-thread"
+        self._write_meta("worker", meta)
+        self.assertIn("started worker", self._poll_events())
+
+    def test_events_restart_only_repeats_unanswered_questions_even_on_idle_runs(self):
+        self._make_run("worker")
+        with contextlib.redirect_stdout(io.StringIO()):
+            cf.cmd_ask(argparse.Namespace(name="worker", message="ordinary?", blocking=False))
+            cf.cmd_ask(argparse.Namespace(name="worker", message="blocked?", blocking=True))
+        for _ in range(2):
+            output = self._poll_events()
+            self.assertIn("ordinary?", output)
+            self.assertIn("blocked?", output)
+        with contextlib.redirect_stdout(io.StringIO()):
+            cf.cmd_tell(argparse.Namespace(name="worker", message="yes"))
+        self.assertEqual(self._poll_events(), "")
+        self.assertEqual(cf.read_outbox("worker", include_unanswered_blocking=True), [])
+        with mock.patch.object(hook, "RUNS", self.runs):
+            self.assertEqual(hook.drain_outbox("worker"), [])
+        history = io.StringIO()
+        with contextlib.redirect_stdout(history):
+            cf.cmd_inbox(argparse.Namespace(names=["worker"], peek=True, all=True))
+        self.assertIn("answered", history.getvalue())
+        self.assertNotIn("unanswered", history.getvalue())
+        # A fresh question can have the same second's timestamp as the reply.
+        with contextlib.redirect_stdout(io.StringIO()):
+            cf.cmd_ask(argparse.Namespace(name="worker", message="new?", blocking=False))
+        self.assertIn("new?", self._poll_events())
+
+    def test_events_never_emits_answered_questions_on_later_polls(self):
+        self._make_run("worker", pid=os.getpid())
+        def ask_and_answer():
+            with contextlib.redirect_stdout(io.StringIO()):
+                cf.cmd_ask(argparse.Namespace(name="worker", message="already answered", blocking=True))
+                cf.cmd_tell(argparse.Namespace(name="worker", message="yes"))
+        self.assertNotIn("already answered", self._poll_events(between_polls=ask_and_answer))
+
+    def test_events_reconciles_legacy_nonblocking_answers_from_retained_inbox(self):
+        self._write_outbox("worker", [
+            {"at": "2026-09-20T01:00:00+00:00", "text": "old?", "read": True},
+            {"at": "2026-09-20T03:00:00+00:00", "text": "unanswered?", "read": True},
+        ])
+        self._write_jsonl(self.runs / "worker" / "inbox.jsonl", [
+            {"at": "2026-09-20T02:00:00+00:00", "text": "yes", "read": True},
+        ])
+        output = self._poll_events()
+        self.assertNotIn("old?", output)
+        self.assertIn("unanswered?", output)
+
     def test_a_blocking_question_survives_being_read_and_only_an_answer_clears_it(self):
         # Reading is not answering. The agent has stopped and is waiting, so a
         # surface that goes quiet because someone glanced at it is lying.
@@ -619,7 +717,7 @@ time.sleep(30)
         second = cf.read_outbox("blocked", include_unanswered_blocking=True)
         self.assertEqual([m["text"] for m in second], ["I am stuck"])
 
-        self.assertEqual(cf.mark_blocking_answered("blocked"), 1)
+        self.assertEqual(cf.mark_questions_answered("blocked"), 2)
         self.assertEqual(cf.read_outbox("blocked", include_unanswered_blocking=True), [])
         self.assertEqual(cf.unanswered_blocking("blocked"), [])
 
@@ -666,7 +764,7 @@ time.sleep(30)
         with mock.patch.object(hook, "RUNS", self.runs):
             first = [m["text"] for m in hook.drain_outbox("blocked-hook")]
             second = [m["text"] for m in hook.drain_outbox("blocked-hook")]
-            cf.mark_blocking_answered("blocked-hook")
+            cf.mark_questions_answered("blocked-hook")
             third = [m["text"] for m in hook.drain_outbox("blocked-hook")]
         self.assertEqual(first, ["one-shot", "still stuck"])
         self.assertEqual(second, ["still stuck"])
@@ -846,7 +944,7 @@ time.sleep(30)
             cf.cmd_tell(argparse.Namespace(name="stuck", message="this one"))
 
         self.assertEqual(cf.unanswered_blocking("stuck"), [])
-        self.assertIn("1 blocking question(s) marked answered", out.getvalue())
+        self.assertIn("1 question(s) marked answered", out.getvalue())
         # And the answer actually reached the agent's inbox.
         inbox = (self.runs / "stuck" / "inbox.jsonl").read_text(encoding="utf-8")
         self.assertIn("this one", inbox)
@@ -920,7 +1018,7 @@ time.sleep(30)
         prompt = json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": "one"})
         expected = (
             "codex-fleet: no events monitor armed; arm with "
-            "Monitor({command:'codex-fleet events', persistent:true})"
+            "Monitor({command:'codex-fleet events'})"
         )
         state = self.fleet_home / ".hook-seen.json"
 
@@ -1115,7 +1213,7 @@ time.sleep(30)
             self.assertIn("worker BLOCKING: need a decision", context)
 
         # Answering is what stops it, and only `tell` answers.
-        cf.mark_blocking_answered("worker")
+        cf.mark_questions_answered("worker")
         third = self._run_hook("codex-fleet-status.py")
         self.assertEqual(third.returncode, 0)
         self.assertEqual(third.stdout, "")

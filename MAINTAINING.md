@@ -26,8 +26,9 @@ The CLI, hooks and skill are symlinked by `install.sh`:
 | `hooks/codex-fleet-stop.py` | `~/.claude/hooks/codex-fleet-stop.py` | Claude Code, on `Stop` |
 | `skills/codex-fleet/SKILL.md` | `~/.claude/skills/codex-fleet/SKILL.md` | Claude Code skill discovery |
 
-Symlinks, not copies, so an edit here is live immediately and there is no deploy
-step to forget.
+Symlinks, not copies: edits to the checkout targeted by the symlinks are live.
+Edits in another worktree are not installed until the links are changed or the
+commits are integrated into the installed checkout.
 
 Registration is separate from installation and `install.sh` deliberately does
 not do it, because both hosts gate it:
@@ -147,24 +148,32 @@ model sees the prompt, with `unexpected argument '--add-dir' found` buried in
 `turn-N.err`. **If you add anything to the spawn command, check the resume path
 in the same edit.**
 
-**The fleet connection is one persistent Monitor, armed once per session.**
-`codex-fleet events` prints one line per fleet event forever: started, finished
-(with the first line of the result and the command to read it), FAILED,
-stopped, ASKING (a blocking question, once), stalled (10/30/60 min, once per
-bucket). On start it prints the runs it inherited. From Claude Code:
+**The fleet connection is one Monitor per session, restarted when it expires.**
+The harness stops monitors after 30 minutes and has no `persistent` option:
 
-    Monitor({ command: "codex-fleet events", persistent: true, description: "codex fleet" })
+    Monitor({ command: "codex-fleet events", description: "codex fleet" })
 
-Every line reaches the orchestrator as a notification whether it is idle or
-mid-turn, so nothing is re-armed and no command is remembered. The outbound
-half is `codex-fleet tell`, which the agent's PostToolUse hook delivers on its
-next tool call. That is the whole connection.
+Re-arm that command when it exits. `events` saves its existing run/turn/stall
+snapshot under the fleet home after every poll using atomic replacement; it
+must not wait for a graceful exit because the harness can kill it. The file is
+keyed by the same session identity as the stream lock, with a separate `--all`
+view. Keep `CLAUDE_CODE_SESSION_ID` (or `CODEX_FLEET_OWNER`) stable on restart.
+Already reported lifecycle/stall events stay quiet, and a completion or new
+turn observed after downtime is reported once. A new session initially reports
+running agents without replaying completed-run history.
 
-This replaced a workflow built on `wait`, which returns on the first completion
-and had to be re-issued every time. It was dropped four times in two days, three
-of them the same way: started with a shell `&`, orphaned to PID 1 when the shell
-exited, visible to pgrep and observed by nobody. `wait` stays for humans and
-scripts; it warns on stderr when it has no `claude` ancestor.
+Unanswered questions, including ones from idle agents, appear on each restart
+and once per question within a monitor. `tell` marks **all** outstanding
+questions answered and read, not just blocking questions. Answered questions
+are suppressed on every poll, not merely the first. Older nonblocking questions
+lack an answer flag, so the retained inbox's latest reply timestamp retires
+questions at or before it. New questions have an explicit `answered: false`,
+so a later question in the same second is not mistaken for an old answer.
+`inbox --all` remains the explicit history view.
+
+The snapshot is not a delivery acknowledgement from the harness: termination
+between printing a lifecycle event and saving the poll can repeat that event.
+Answered questions still cannot replay because their answer state is separate.
 
 **Coverage means observed, and the Stop hook enforces it.** Both hooks count a
 `codex-fleet events` or `wait` process as coverage only when a live `claude`
@@ -309,9 +318,9 @@ over the same 52 turns spanned 2.3x to 8.8x. Command count is not usable either,
 at 2.8x across its middle half against 1.2x for reasoning items.
 
 **Reading a question is not answering it.** An agent that ran `codex-fleet ask
---blocking` has stopped and is waiting. A NON-blocking question is delivered once,
-because repeating an FYI is noise. A blocking one repeats on every hook fire and
-keeps showing in `inbox` until `codex-fleet tell` answers it, and `list` renders
+--blocking` has stopped and is waiting. A NON-blocking question is delivered
+once by the status hook, because repeating an FYI on every hook fire is noise.
+A blocking one repeats on every hook fire and keeps showing in `inbox` until `codex-fleet tell` answers it, and `list` renders
 that agent as `ASKING` rather than `running`. Only `tell` clears it, because only
 `tell` reaches the agent.
 

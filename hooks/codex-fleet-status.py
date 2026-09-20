@@ -18,6 +18,8 @@ FAIL-OPEN. Every error path exits 0 with no output. An observability hook that
 can break a tool call is worse than no observability hook.
 """
 
+import contextlib
+import fcntl
 import json
 import os
 import subprocess
@@ -33,6 +35,14 @@ STATE = ROOT / ".hook-seen.json"
 # run, so a genuinely stuck agent says "10m" then "30m" rather than repeating
 # every tool call.
 STALL_BUCKETS_SECONDS = (600, 1800, 3600)
+
+
+@contextlib.contextmanager
+def outbox_lock(path):
+    """Serialize appends with the readers that rewrite the outbox."""
+    with path.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
 
 
 def alive(pid):
@@ -129,33 +139,31 @@ def drain_outbox(name):
     again because someone glanced at it.
     """
     path = RUNS / name / "outbox.jsonl"
-    if not path.exists():
-        return []
     try:
-        lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        with outbox_lock(path):
+            if not path.exists():
+                return []
+            lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            unread, rewritten, changed = [], [], False
+            for ln in lines:
+                try:
+                    msg = json.loads(ln)
+                except ValueError:
+                    rewritten.append(ln)
+                    continue
+                blocking_unanswered = msg.get("blocking") and not msg.get("answered")
+                if (not msg.get("read") and not msg.get("answered")) or blocking_unanswered:
+                    unread.append(msg)
+                    msg["read"] = True
+                    changed = True
+                rewritten.append(json.dumps(msg))
+            if changed:
+                tmp = path.with_suffix(".jsonl.tmp")
+                tmp.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+                os.replace(tmp, path)
+            return unread
     except OSError:
         return []
-    unread, rewritten, changed = [], [], False
-    for ln in lines:
-        try:
-            msg = json.loads(ln)
-        except ValueError:
-            rewritten.append(ln)
-            continue
-        blocking_unanswered = msg.get("blocking") and not msg.get("answered")
-        if (not msg.get("read") and not msg.get("answered")) or blocking_unanswered:
-            unread.append(msg)
-            msg["read"] = True
-            changed = True
-        rewritten.append(json.dumps(msg))
-    if changed:
-        try:
-            tmp = path.with_suffix(".jsonl.tmp")
-            tmp.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
-            os.replace(tmp, path)
-        except OSError:
-            pass
-    return unread
 
 
 def stall_bucket(seconds):

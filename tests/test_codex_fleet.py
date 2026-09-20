@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timezone
@@ -654,6 +655,18 @@ time.sleep(30)
         self._write_meta("worker", meta)
         self.assertIn("started worker", self._poll_events())
 
+    def test_events_repairs_a_valid_json_state_with_the_wrong_shape(self):
+        self._make_run("worker", pid=os.getpid())
+        state = self.fleet_home / (cf.events_lock_name("session-a")[1:] + ".json")
+        state.write_text(json.dumps({"worker": {}}), encoding="utf-8")
+
+        first = self._poll_events()
+
+        self.assertIn("damaged monitor state", first)
+        self.assertIn("running worker", first)
+        self.assertEqual(json.loads(state.read_text())["worker"]["status"], "running")
+        self.assertNotIn("damaged monitor state", self._poll_events())
+
     def test_events_restart_only_repeats_unanswered_questions_even_on_idle_runs(self):
         self._make_run("worker")
         with contextlib.redirect_stdout(io.StringIO()):
@@ -720,6 +733,61 @@ time.sleep(30)
         self.assertEqual(cf.mark_questions_answered("blocked"), 2)
         self.assertEqual(cf.read_outbox("blocked", include_unanswered_blocking=True), [])
         self.assertEqual(cf.unanswered_blocking("blocked"), [])
+
+    def test_ask_cannot_be_erased_by_tell_or_the_status_hook_rewrite(self):
+        outbox = self._write_outbox(
+            "worker",
+            [{"text": "old", "at": "t0", "blocking": False, "read": False}],
+        )
+        original_write_text = Path.write_text
+
+        for rewrite in (
+            lambda: cf.mark_questions_answered("worker"),
+            lambda: hook.drain_outbox("worker"),
+        ):
+            with self.subTest(rewrite=rewrite):
+                self._write_outbox(
+                    "worker",
+                    [{"text": "old", "at": "t0", "blocking": False, "read": False}],
+                )
+                rewriting = threading.Event()
+                ask_finished = threading.Event()
+                errors = []
+
+                def pause_rewrite(path, *args, **kwargs):
+                    if path in (outbox, outbox.with_suffix(".jsonl.tmp")):
+                        rewriting.set()
+                        ask_finished.wait(0.5)
+                    return original_write_text(path, *args, **kwargs)
+
+                def ask():
+                    try:
+                        cf.cmd_ask(argparse.Namespace(
+                            name="worker", message="new question", blocking=False
+                        ))
+                    except Exception as exc:
+                        errors.append(exc)
+                    finally:
+                        ask_finished.set()
+
+                with mock.patch.object(hook, "RUNS", self.runs), \
+                     mock.patch.object(Path, "write_text", new=pause_rewrite), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    rewriter = threading.Thread(target=rewrite)
+                    rewriter.start()
+                    self.assertTrue(rewriting.wait(2), "rewrite did not reach its write")
+                    asker = threading.Thread(target=ask)
+                    asker.start()
+                    rewriter.join(2)
+                    asker.join(2)
+
+                self.assertFalse(rewriter.is_alive())
+                self.assertFalse(asker.is_alive())
+                self.assertEqual(errors, [])
+                self.assertIn(
+                    "new question",
+                    [json.loads(line)["text"] for line in outbox.read_text().splitlines()],
+                )
 
     def test_long_ask_reaches_events_and_inbox_all_after_delivery(self):
         question = "a" * 299 + "\n" + "b" * 300

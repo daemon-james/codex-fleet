@@ -1177,6 +1177,13 @@ def cmd_tell(args):
     print(f"queued for {args.name} ({state}); delivered {where}")
 
 
+@contextlib.contextmanager
+def outbox_lock(path):
+    """Serialize appends with the readers that rewrite the outbox."""
+    with path.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
 
 def cmd_ask(args):
     """Raise a question or a blocker WITHOUT ending your turn. Run by the agent.
@@ -1195,14 +1202,16 @@ def cmd_ask(args):
     d = run_dir(name)
     if not d.exists():
         die(f"no run named {name}")
-    with open(d / "outbox.jsonl", "a", encoding="utf-8") as fh:
-        fh.write(json.dumps({
-            "text": args.message,
-            "at": now(),
-            "blocking": bool(args.blocking),
-            "read": False,
-            "answered": False,
-        }) + "\n")
+    path = d / "outbox.jsonl"
+    with outbox_lock(path):
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "text": args.message,
+                "at": now(),
+                "blocking": bool(args.blocking),
+                "read": False,
+                "answered": False,
+            }) + "\n")
     if args.blocking:
         print("raised as BLOCKING. Keep working on anything that does not depend "
               "on the answer; check back for a reply on later tool calls.")
@@ -1217,30 +1226,30 @@ def mark_questions_answered(name):
     answers it. Reading a question does not.
     """
     path = run_dir(name) / "outbox.jsonl"
-    if not path.exists():
-        return 0
     try:
-        lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        with outbox_lock(path):
+            if not path.exists():
+                return 0
+            lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            rewritten, count = [], 0
+            for ln in lines:
+                try:
+                    msg = json.loads(ln)
+                except ValueError:
+                    rewritten.append(ln)
+                    continue
+                if not msg.get("answered"):
+                    msg["answered"] = True
+                    msg["read"] = True
+                    count += 1
+                rewritten.append(json.dumps(msg))
+            if count:
+                tmp = path.with_suffix(".jsonl.tmp")
+                tmp.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+                os.replace(tmp, path)
+            return count
     except OSError:
         return 0
-    rewritten, count = [], 0
-    for ln in lines:
-        try:
-            msg = json.loads(ln)
-        except ValueError:
-            rewritten.append(ln)
-            continue
-        if not msg.get("answered"):
-            msg["answered"] = True
-            msg["read"] = True
-            count += 1
-        rewritten.append(json.dumps(msg))
-    if count:
-        try:
-            path.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
-        except OSError:
-            return 0
-    return count
 
 
 def all_questions(name):
@@ -1310,38 +1319,36 @@ def read_outbox(
     only call that actually reaches the agent.
     """
     path = run_dir(name) / "outbox.jsonl"
-    if not path.exists():
-        return []
     try:
-        lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        with outbox_lock(path):
+            if not path.exists():
+                return []
+            lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            unread, rewritten, changed = [], [], False
+            for ln in lines:
+                try:
+                    msg = json.loads(ln)
+                except ValueError:
+                    rewritten.append(ln)
+                    continue
+                blocking_unanswered = msg.get("blocking") and not msg.get("answered")
+                if (
+                    include_read
+                    or (not msg.get("read") and not msg.get("answered"))
+                    or (include_unanswered_blocking and blocking_unanswered)
+                ):
+                    unread.append(msg)
+                    if mark_read and not msg.get("read"):
+                        msg["read"] = True
+                        changed = True
+                rewritten.append(json.dumps(msg))
+            if changed:
+                tmp = path.with_suffix(".jsonl.tmp")
+                tmp.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+                os.replace(tmp, path)
+            return unread
     except OSError:
         return []
-    unread, rewritten, changed = [], [], False
-    for ln in lines:
-        try:
-            msg = json.loads(ln)
-        except ValueError:
-            rewritten.append(ln)
-            continue
-        blocking_unanswered = msg.get("blocking") and not msg.get("answered")
-        if (
-            include_read
-            or (not msg.get("read") and not msg.get("answered"))
-            or (include_unanswered_blocking and blocking_unanswered)
-        ):
-            unread.append(msg)
-            if mark_read and not msg.get("read"):
-                msg["read"] = True
-                changed = True
-        rewritten.append(json.dumps(msg))
-    if changed:
-        try:
-            tmp = path.with_suffix(".jsonl.tmp")
-            tmp.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
-            os.replace(tmp, path)
-        except OSError:
-            pass
-    return unread
 
 
 def events_lock_path(owner):
@@ -1483,11 +1490,19 @@ def cmd_events(args):
                          ("-all" if getattr(args, "all", False) else "") + ".json")
     try:
         seen = json.loads(state_path.read_text())
-        if not isinstance(seen, dict):
+        if not isinstance(seen, dict) or any(
+            not isinstance(item, dict)
+            or "status" not in item
+            or not isinstance(item.get("stall", 0), (int, float))
+            for item in seen.values()
+        ):
             raise ValueError("invalid events state")
         restarting = True
     except (OSError, ValueError):
+        damaged = state_path.exists()
         seen, restarting = {}, False
+        if damaged:
+            print("codex-fleet: damaged monitor state reset; continuing", flush=True)
     asked = set()
     first = True
     try:

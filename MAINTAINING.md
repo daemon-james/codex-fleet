@@ -162,6 +162,21 @@ Already reported lifecycle/stall events stay quiet, and a completion or new
 turn observed after downtime is reported once. A new session initially reports
 running agents without replaying completed-run history.
 
+Only transitions after the baseline are news (L-123: a re-armed monitor once
+reported a review finished 32 hours earlier as started, stalled, then
+finished). The baseline is the snapshot's last save on a restart, or the
+monitor's start on a fresh one; a run missing from the snapshot that is not
+running is reported only if its log changed after the baseline. A live pid is
+not enough to call a run running: a pruned run, a turn log that already ends
+in `turn.completed`/`turn.failed`, or a pid whose process started more than
+`EVENTS_PID_REUSE_SLACK` seconds after the turn launched (`/proc`) is treated
+as not running, and a turn the snapshot records as ended is never announced
+as started again. Stall lines (`EVENTS_STALL_BUCKETS`) skip a run with an
+unanswered blocking question, since its `ASKING` line is the signal, and a run
+whose last event opened a tool call that has not closed (a long command, a CI
+watch) gets one `waiting ... one command: <cmd>` line instead of stalls at 10,
+30 and 60 minutes.
+
 Unanswered questions, including ones from idle agents, appear on each restart
 and once per question within a monitor. `tell` marks **all** outstanding
 questions answered and read, not just blocking questions. Answered questions

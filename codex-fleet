@@ -1468,6 +1468,120 @@ def script_fingerprint():
 
 EVENTS_POLL_SECONDS = 2
 EVENTS_STALL_BUCKETS = (600, 1800, 3600)
+EVENTS_TAIL_BYTES = 65536
+# A pid whose process began this long after the turn was launched is not the
+# process the turn launched: the kernel handed the number to somebody else.
+EVENTS_PID_REUSE_SLACK = 60
+
+
+def tail_events(path, limit=EVENTS_TAIL_BYTES):
+    """The last events of a turn log, without reading a large log whole.
+
+    The monitor needs only the end of a log (did the turn finish, is a tool
+    call still open) and polls every run every two seconds.
+    """
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - limit))
+            data = fh.read()
+    except OSError:
+        return []
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    if size > limit and lines:
+        lines = lines[1:]  # the first line was cut by the seek
+    events = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return events
+
+
+def process_started_at(pid):
+    """Wall-clock start of a live process, or None where /proc cannot say."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            stat = fh.read()
+        ticks = int(stat[stat.rindex(")") + 2 :].split()[19])
+        with open("/proc/stat", encoding="utf-8") as fh:
+            boot = next(int(ln.split()[1]) for ln in fh if ln.startswith("btime "))
+        return boot + ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError, StopIteration):
+        return None
+
+
+def turn_launched_at(meta):
+    """When the current turn's process was launched, or None if unrecorded."""
+    turn = meta.get("turns", 1)
+    raw = None
+    for prompt in reversed(meta.get("prompts") or []):
+        if isinstance(prompt, dict) and prompt.get("turn") == turn:
+            raw = prompt.get("at")
+            break
+    if raw is None and turn == 1:
+        raw = meta.get("created_at")
+    try:
+        return datetime.fromisoformat(raw).timestamp() if raw else None
+    except (TypeError, ValueError):
+        return None
+
+
+def events_status(name, meta, tail):
+    """status_of, except that a live pid alone does not make a run running.
+
+    On 2026-09-22 a re-armed monitor announced a review that had finished 32
+    hours earlier as started, then stalled, then finished, and the stop hook
+    demanded its result be read again. `status_of` trusts any live process
+    with the recorded pid. For the monitor that is not enough, because a
+    "started" line makes an orchestrator act. A run is not running when:
+      - it was pruned (pruning only ever happens to a run with no process),
+      - its latest turn log already ends the turn, or
+      - the process holding the pid began after the turn was launched, so the
+        number now belongs to an unrelated process.
+    """
+    st = status_of(name, meta, tail)
+    if st != "running":
+        return st
+    dead = dict(meta, pid=None)
+    if meta.get("pruned_at"):
+        return status_of(name, dead, tail)
+    for ev in reversed(tail):
+        if ev.get("type") in ("turn.completed", "turn.failed"):
+            return status_of(name, dead, tail)
+    started = process_started_at(meta.get("pid"))
+    launched = turn_launched_at(meta)
+    if started and launched and started > launched + EVENTS_PID_REUSE_SLACK:
+        return status_of(name, dead, tail)
+    return st
+
+
+def inflight_item(tail):
+    """The tool call the agent is inside, as (key, description), or None.
+
+    A turn whose last event opened an item and never closed it is waiting on
+    that item: a long test run, a CI watch, a deliberate sleep. That is a wait,
+    not a stall, and saying "stalled" at 10, 30 and 60 minutes is noise.
+    """
+    if not tail or tail[-1].get("type") != "item.started":
+        return None
+    item = tail[-1].get("item") or {}
+    kind = item.get("type", "item")
+    if kind == "command_execution":
+        cmd = item.get("command") or item.get("cmd") or ""
+        if isinstance(cmd, list):
+            cmd = " ".join(cmd)
+        desc = f"command: {cmd.strip()[:120]}"
+    elif kind == "mcp_tool_call":
+        desc = f"tool call: {item.get('server', '?')}.{item.get('tool', '?')}"
+    else:
+        desc = kind
+    return (item.get("id") or desc, desc)
 
 
 def cmd_events(args):
@@ -1476,6 +1590,12 @@ def cmd_events(args):
     Restart after the host's monitor timeout. Run/turn/stall state survives
     restarts per session and view; unanswered questions are shown again.
     Lines are flushed individually; a bad run is retried on the next poll.
+
+    Only transitions after the baseline are reported. The baseline is the
+    saved snapshot (as of its last save) on a restart, or the moment this
+    monitor started on a fresh one. A run missing from the snapshot that is
+    not running is reported only if it did something after the baseline; a
+    turn recorded as ended is never reported as started again.
     """
     owner = current_owner()
     holder = claim_events_lock(owner)
@@ -1488,7 +1608,9 @@ def cmd_events(args):
 
     state_path = ROOT / (events_lock_name(owner)[1:] +
                          ("-all" if getattr(args, "all", False) else "") + ".json")
+    baseline = time.time()
     try:
+        saved_at = state_path.stat().st_mtime
         seen = json.loads(state_path.read_text())
         if not isinstance(seen, dict) or any(
             not isinstance(item, dict)
@@ -1498,6 +1620,7 @@ def cmd_events(args):
         ):
             raise ValueError("invalid events state")
         restarting = True
+        baseline = saved_at
     except (OSError, ValueError):
         damaged = state_path.exists()
         seen, restarting = {}, False
@@ -1515,65 +1638,14 @@ def cmd_events(args):
                 for name, meta in all_runs():
                     if not getattr(args, "all", False) and not owned_here(meta):
                         continue
-                    st = status_of(name, meta)
-                    prev = seen.get(name)
-                    run_id = [meta.get("created_at"), meta.get("thread_id")]
-                    # Spawn writes thread_id shortly after launch. Filling it in
-                    # is not a second start of the same run.
-                    if prev and prev.get("run") not in (run_id, [run_id[0], None]):
-                        prev = None
-                    turn = meta.get("turns", 1)
-                    new_turn = prev and prev.get("turn") != turn
-                    latest = run_dir(name) / f"turn-{meta.get('turns', 1)}.jsonl"
-                    quiet = time.time() - (mtime(latest, meta) or time.time())
-                    role = meta.get("role", "?")
-
-                    if st == "running" and (prev is None or new_turn or prev["status"] != "running"):
-                        verb = "running" if first and not restarting else "started"
-                        print(f"{verb} {name} ({role})", flush=True)
-                    elif st != "running" and (
-                        (prev and (prev["status"] == "running" or new_turn))
-                        or (prev is None and (restarting or not first))
-                    ):
-                        verb = {"idle": "finished", "failed": "FAILED", "stopped": "stopped without completing"}.get(st, st)
-                        latest_events = read_events(latest)
-                        msg = last_message(latest_events, name).replace("\n", " ")[:160]
-                        print(
-                            f"{verb} {name} ({role}) {mcp_text(latest_events, meta)}: "
-                            f"{msg}  ->  codex-fleet result {name}",
-                            flush=True,
-                        )
-
-                    # Every question, blocking or not. A non-blocking ask is still
-                    # a question the agent wants answered; the status hook marks it
-                    # read on its first fire, so if this stream only carried
-                    # blocking ones the orchestrator never saw it. That happened on
-                    # 2026-08-22: an engineer asked whether to change a hook
-                    # package, got no answer, and shipped without it.
-                    for index, q in enumerate(all_questions(name)):
-                        key = (name, run_id[0], index, q.get("at"))
-                        if q.get("answered") or key in asked:
-                            continue
-                        asked.add(key)
-                        kind = "ASKING (blocking)" if q.get("blocking") else "asks"
-                        blocking = str(bool(q.get("blocking"))).lower()
-                        print(
-                            f"{kind} {name} [blocking={blocking}]: {q.get('text', '')}"
-                            f"  ->  codex-fleet tell {name} \"<answer>\"",
-                            flush=True,
-                        )
-
-                    bucket = 0
-                    if st == "running":
-                        for b in EVENTS_STALL_BUCKETS:
-                            if quiet >= b:
-                                bucket = b
-                    if bucket and bucket > (prev or {}).get("stall", 0):
-                        print(
-                            f"stalled {name} ({role}): no event for {bucket // 60} minutes  ->  codex-fleet tail {name} -n 15, or kill it",
-                            flush=True,
-                        )
-                    seen[name] = {"run": run_id, "turn": turn, "status": st, "stall": bucket}
+                    try:
+                        seen[name] = events_poll_run(name, meta, seen.get(name), asked,
+                                                     fresh=first and not restarting,
+                                                     baseline=baseline)
+                    except Exception:
+                        # One bad run must not stop the others being reported
+                        # or the snapshot being saved; it is retried next poll.
+                        continue
                 first = False
                 # Save during polling, not at exit: the monitor may be SIGKILLed.
                 tmp = state_path.with_suffix(".tmp")
@@ -1585,6 +1657,96 @@ def cmd_events(args):
             time.sleep(EVENTS_POLL_SECONDS)
     finally:
         release_events_lock(owner)
+
+
+def events_poll_run(name, meta, prev, asked, fresh, baseline):
+    """Report one run's changes since `prev` and return its new snapshot."""
+    run_id = [meta.get("created_at"), meta.get("thread_id")]
+    # Spawn writes thread_id shortly after launch. Filling it in
+    # is not a second start of the same run.
+    if prev and prev.get("run") not in (run_id, [run_id[0], None]):
+        prev = None
+    turn = meta.get("turns", 1)
+    new_turn = prev and prev.get("turn") != turn
+    latest = run_dir(name) / f"turn-{meta.get('turns', 1)}.jsonl"
+    tail = tail_events(latest)
+    st = events_status(name, meta, tail)
+    # A turn already recorded as ended cannot start again; only a new turn
+    # can. Whatever makes the pid look alive, this is not a start.
+    if st == "running" and prev and not new_turn and prev.get("status") != "running":
+        st = prev["status"]
+    last_activity = mtime(latest, meta)
+    quiet = time.time() - (last_activity or time.time())
+    role = meta.get("role", "?")
+
+    if st == "running" and (prev is None or new_turn or prev["status"] != "running"):
+        verb = "running" if fresh else "started"
+        print(f"{verb} {name} ({role})", flush=True)
+    elif st != "running" and (
+        (prev and (prev["status"] == "running" or new_turn))
+        # Unknown to the snapshot and already over: report it only if it
+        # did something after the baseline, i.e. it finished while no
+        # monitor was watching. Older history is not news.
+        or (prev is None and last_activity > baseline)
+    ):
+        verb = {"idle": "finished", "failed": "FAILED", "stopped": "stopped without completing"}.get(st, st)
+        latest_events = read_events(latest)
+        msg = last_message(latest_events, name).replace("\n", " ")[:160]
+        print(
+            f"{verb} {name} ({role}) {mcp_text(latest_events, meta)}: "
+            f"{msg}  ->  codex-fleet result {name}",
+            flush=True,
+        )
+
+    # Every question, blocking or not. A non-blocking ask is still
+    # a question the agent wants answered; the status hook marks it
+    # read on its first fire, so if this stream only carried
+    # blocking ones the orchestrator never saw it. That happened on
+    # 2026-08-22: an engineer asked whether to change a hook
+    # package, got no answer, and shipped without it.
+    for index, q in enumerate(all_questions(name)):
+        key = (name, run_id[0], index, q.get("at"))
+        if q.get("answered") or key in asked:
+            continue
+        asked.add(key)
+        kind = "ASKING (blocking)" if q.get("blocking") else "asks"
+        blocking = str(bool(q.get("blocking"))).lower()
+        print(
+            f"{kind} {name} [blocking={blocking}]: {q.get('text', '')}"
+            f"  ->  codex-fleet tell {name} \"<answer>\"",
+            flush=True,
+        )
+
+    bucket = 0
+    if st == "running":
+        for b in EVENTS_STALL_BUCKETS:
+            if quiet >= b:
+                bucket = b
+    wait = (prev or {}).get("wait") if bucket else None
+    if bucket and bucket > (prev or {}).get("stall", 0):
+        item = inflight_item(tail)
+        if unanswered_blocking(name):
+            # Waiting on the orchestrator, which already has the ASKING
+            # line. Quiet is expected until `tell` answers it.
+            pass
+        elif item:
+            # Inside one long tool call: said once, with what it is
+            # waiting on, and not again at 30 and 60 minutes.
+            key, desc = item
+            if key != wait:
+                print(
+                    f"waiting {name} ({role}): one {desc} has been running for "
+                    f"{bucket // 60} minutes; not repeated while it runs  ->  "
+                    f"codex-fleet tail {name} -n 15, or kill it",
+                    flush=True,
+                )
+            wait = key
+        else:
+            print(
+                f"stalled {name} ({role}): no event for {bucket // 60} minutes  ->  codex-fleet tail {name} -n 15, or kill it",
+                flush=True,
+            )
+    return {"run": run_id, "turn": turn, "status": st, "stall": bucket, "wait": wait}
 
 
 def cmd_inbox(args):

@@ -547,11 +547,15 @@ time.sleep(30)
         self.assertEqual(result.getvalue().splitlines()[0], "mcp=2/1")
 
         sleeps = 0
+        # The monitor must see the turn in flight first: a log that already
+        # ends the turn is a finished run whatever the pid says.
+        self._write_jsonl(_run / "turn-1.jsonl", events[:-1])
 
         def finish_then_stop(_seconds):
             nonlocal sleeps
             sleeps += 1
             if sleeps == 1:
+                self._write_jsonl(_run / "turn-1.jsonl", events)
                 meta["pid"] = None
                 self._write_meta("mcp-run", meta)
                 return
@@ -666,6 +670,97 @@ time.sleep(30)
         self.assertIn("running worker", first)
         self.assertEqual(json.loads(state.read_text())["worker"]["status"], "running")
         self.assertNotIn("damaged monitor state", self._poll_events())
+
+    def _old_iso(self, seconds_ago):
+        return datetime.fromtimestamp(self.clock - seconds_ago, timezone.utc).isoformat()
+
+    def _events_state(self, owner="session-a"):
+        return self.fleet_home / (cf.events_lock_name(owner)[1:] + ".json")
+
+    def test_events_rearm_after_finished_runs_announces_nothing(self):
+        # L-123: a re-armed monitor announced a review finished 32 hours
+        # earlier as started, then stalled, then finished.
+        day = 86400
+        done = [{"type": "item.completed", "item": {"type": "agent_message", "text": "REJECT"}},
+                {"type": "turn.completed", "usage": {}}]
+        # Finished, and some process now holds its old pid.
+        self._make_run("pid-reused", pid=os.getpid(), turns=[done],
+                       created_at=self._old_iso(2 * day), log_mtimes=[self.clock - 32 * 3600])
+        # Pruned: no log left, only the recorded outcome, and a live pid.
+        self._make_run("pruned", pid=os.getpid(), turns=[],
+                       created_at=self._old_iso(2 * day),
+                       meta_updates={"pruned_at": self._old_iso(day), "final_status": "idle",
+                                     "last_activity": self.clock - 32 * 3600})
+        # Died without ending its turn; the pid was handed to a later process.
+        self._make_run("pid-recycled", pid=os.getpid(), turns=[[]],
+                       created_at=self._old_iso(2 * day), log_mtimes=[self.clock - 32 * 3600])
+        # Its log ends the turn; the process has not exited yet, or never will.
+        self._make_run("ended-live", pid=os.getpid(), turns=[done],
+                       log_mtimes=[self.clock - 3600])
+        # Finished before the snapshot was saved, but missing from it.
+        self._make_run("unknown-old", turns=[done], log_mtimes=[self.clock - 32 * 3600])
+        # The snapshot already says this turn ended, yet its pid looks alive.
+        _run, sticky = self._make_run("sticky", turns=[done], log_mtimes=[self.clock - 3600])
+
+        self.assertEqual(self._poll_events(), "")
+        state = json.loads(self._events_state().read_text())
+        del state["unknown-old"]
+        self._events_state().write_text(json.dumps(state))
+        sticky["pid"] = os.getpid()
+        self._write_meta("sticky", sticky)
+        self._write_jsonl(self.runs / "sticky" / "turn-1.jsonl", done[:1])
+        os.utime(self.runs / "sticky" / "turn-1.jsonl", (self.clock - 3600, self.clock - 3600))
+        for _ in range(3):
+            self.assertEqual(self._poll_events(), "")
+        self.assertEqual(
+            {name: item["status"] for name, item in json.loads(self._events_state().read_text()).items()},
+            {"pid-reused": "idle", "pruned": "idle", "pid-recycled": "stopped", "ended-live": "idle",
+             "unknown-old": "idle", "sticky": "idle"},
+        )
+
+    def test_events_transition_after_start_is_announced_once(self):
+        run, meta = self._make_run("worker", pid=os.getpid())
+
+        def finish():
+            meta["pid"] = None
+            self._write_meta("worker", meta)
+            self._write_jsonl(run / "turn-1.jsonl", [{"type": "turn.completed"}])
+
+        first = self._poll_events(between_polls=finish)
+        self.assertEqual(first.count("running worker"), 1)
+        self.assertEqual(first.count("finished worker"), 1)
+        self.assertEqual(self._poll_events(), "")
+
+        # Spawned and finished while no monitor was running: news, once.
+        self._make_run("in-the-gap", turns=[[{"type": "turn.completed"}]],
+                       log_mtimes=[time.time() + 5])
+        self.assertEqual(self._poll_events().count("finished in-the-gap"), 1)
+        self.assertEqual(self._poll_events(), "")
+
+    def test_events_blocking_question_is_not_called_stalled(self):
+        self._make_run("asker", pid=os.getpid(), log_mtimes=[self.clock - 4000])
+        with contextlib.redirect_stdout(io.StringIO()):
+            cf.cmd_ask(argparse.Namespace(name="asker", message="which base?", blocking=True))
+        for _ in range(2):
+            output = self._poll_events()
+            self.assertIn("ASKING (blocking) asker", output)
+            self.assertNotIn("stalled", output)
+
+    def test_events_long_tool_call_is_announced_once_with_its_reason(self):
+        run, _meta = self._make_run("waiter", pid=os.getpid(), turns=[[
+            {"type": "item.started", "item": {"id": "item_7", "type": "command_execution",
+                                              "command": "gh run watch 123"}},
+        ]], log_mtimes=[self.clock - 700])
+        first = self._poll_events()
+        self.assertIn("waiting waiter (engineer): one command: gh run watch 123", first)
+        self.assertNotIn("stalled", first)
+        log = run / "turn-1.jsonl"
+        for quiet in (2000, 4000):
+            os.utime(log, (self.clock - quiet, self.clock - quiet))
+            self.assertEqual(self._poll_events(), "")
+        # A plain silence with no open tool call is still a stall.
+        self._make_run("silent", pid=os.getpid(), log_mtimes=[self.clock - 700])
+        self.assertIn("stalled silent", self._poll_events())
 
     def test_events_restart_only_repeats_unanswered_questions_even_on_idle_runs(self):
         self._make_run("worker")

@@ -211,7 +211,9 @@ puts the timestamp back leaves both unchanged.
 
 Monitor hosts may stop the stream after 30 minutes; restart `codex-fleet events`
 with the same session identity. Its run/turn/stall snapshot survives restarts,
-so only changes and still-unanswered questions are shown. `tell` retires both
+so only changes and still-unanswered questions are shown; finished runs are
+never replayed as started, an agent waiting on a blocking question is not
+called stalled, and one long tool call is reported once as `waiting`. `tell` retires both
 blocking and nonblocking questions; answered questions never replay. `--all`
 keeps a separate snapshot for the machine-wide view.
 
